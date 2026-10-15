@@ -1,11 +1,12 @@
-//! Backend-agnostic renderer contract: D3D11 today ([`crate::d3d11`]).
+//! Backend-agnostic renderer contract: D3D11 on Windows (`crate::d3d11`), Metal on macOS
+//! (`crate::metal`).
 //! A backend only turns [`DrawList`] + [`TextureDelta`]s into draw calls; the
 //! conventions are documented in [`super::draw`].
 
 use super::draw::{DrawList, TextureDelta};
 
 pub trait MenuRenderer {
-    /// Where to draw: D3D11 the backbuffer texture, Vulkan an image view plus command buffer.
+    /// Where to draw: D3D11 the backbuffer texture, Metal a texture plus command buffer.
     type Target<'t>;
 
     /// Creates, patches or frees textures. Apply creates/updates before [`Self::draw`];
