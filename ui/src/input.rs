@@ -1,10 +1,51 @@
-//! Win32 window messages → [`KitInput`] ([`Collector`]).
+//! Platform input → [`KitInput`] ([`Collector`]): the host feeds pointer, button, wheel,
+//! key and text events between two frames, the frame takes one [`KitInput`]. Key codes
+//! are Windows virtual-key codes on every platform (the kit's keybind names use them);
+//! [`Collector::feed`] translates Win32 window messages directly.
 
+#[cfg(windows)]
 use windows_sys::Win32::Foundation::WPARAM;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
+#[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use crate::kit::{Key, KitInput};
+
+/// Virtual-key codes the collector itself interprets (same values as `VK_*`).
+pub mod vk {
+    pub const LBUTTON: u32 = 0x01;
+    pub const RBUTTON: u32 = 0x02;
+    pub const MBUTTON: u32 = 0x04;
+    pub const XBUTTON1: u32 = 0x05;
+    pub const XBUTTON2: u32 = 0x06;
+    pub const BACK: u32 = 0x08;
+    pub const TAB: u32 = 0x09;
+    pub const RETURN: u32 = 0x0D;
+    pub const SHIFT: u32 = 0x10;
+    pub const CONTROL: u32 = 0x11;
+    pub const MENU: u32 = 0x12;
+    pub const CAPITAL: u32 = 0x14;
+    pub const ESCAPE: u32 = 0x1B;
+    pub const SPACE: u32 = 0x20;
+    pub const PRIOR: u32 = 0x21;
+    pub const NEXT: u32 = 0x22;
+    pub const END: u32 = 0x23;
+    pub const HOME: u32 = 0x24;
+    pub const LEFT: u32 = 0x25;
+    pub const UP: u32 = 0x26;
+    pub const RIGHT: u32 = 0x27;
+    pub const DOWN: u32 = 0x28;
+    pub const INSERT: u32 = 0x2D;
+    pub const DELETE: u32 = 0x2E;
+    pub const NUMPAD0: u32 = 0x60;
+    pub const F1: u32 = 0x70;
+    pub const LSHIFT: u32 = 0xA0;
+    pub const RSHIFT: u32 = 0xA1;
+    pub const LCONTROL: u32 = 0xA2;
+    pub const RCONTROL: u32 = 0xA3;
+    pub const LMENU: u32 = 0xA4;
+    pub const RMENU: u32 = 0xA5;
+    pub const OEM_3: u32 = 0xC0;
+}
 
 /// Input between two menu frames: the window procedure feeds messages, the frame takes
 /// one [`KitInput`].
@@ -12,18 +53,18 @@ use crate::kit::{Key, KitInput};
 pub struct Collector {
     mouse: [f32; 2],
     down: [bool; 2],
-    /// Seit dem letzten Abholen gedrückt: ein Klick innerhalb eines Frames geht nicht verloren.
+    /// Pressed since the last take: a click within one frame is not lost.
     pressed: [bool; 2],
     wheel: f32,
     keys: Vec<Key>,
     text: String,
-    /// Shift, Strg, Alt gehalten (aus Taste runter/hoch, deterministisch ohne Abfrage).
+    /// Shift, Ctrl, Alt held (from key down/up, deterministic without polling).
     modifiers: [bool; 3],
-    /// Roh-VK-Codes seit dem letzten Abholen (Tastatur und Maustasten, für Tastenbelegung).
+    /// Raw virtual-key codes since the last take (keyboard and mouse buttons, for keybinds).
     pressed_vk: Vec<u32>,
 }
 
-/// Höchstens so viele Roh-Tasten je Frame (Schutz gegen Tastenwiederholung ohne Abholen).
+/// At most this many raw keys per frame (guards against key repeat without a take).
 const MAX_PRESSED: usize = 32;
 
 impl Collector {
@@ -50,81 +91,126 @@ impl Collector {
     pub fn leave(&mut self) {
         self.mouse = [-1.0, -1.0];
     }
+    /// Pointer position in surface pixels.
+    pub fn pointer(&mut self, pos: [f32; 2]) {
+        self.mouse = pos;
+    }
+    /// Mouse button 0 (left) to 4 (X2) pressed or released; 0 and 1 drive the kit, every
+    /// press also records its raw code.
+    pub fn button(&mut self, button: usize, down: bool) {
+        if let Some(b) = self.down.get_mut(button) {
+            *b = down;
+            if down {
+                self.pressed[button] = true;
+            }
+        }
+        if down {
+            let codes = [
+                vk::LBUTTON,
+                vk::RBUTTON,
+                vk::MBUTTON,
+                vk::XBUTTON1,
+                vk::XBUTTON2,
+            ];
+            if let Some(&code) = codes.get(button) {
+                self.press_vk(code);
+            }
+        }
+    }
+    /// Wheel in notches (positive scrolls up).
+    pub fn wheel(&mut self, notches: f32) {
+        self.wheel += notches;
+    }
+    /// A key (virtual-key code) went down or up; modifiers are tracked from these.
+    pub fn key(&mut self, code: u32, down: bool) {
+        let modifier = match code {
+            vk::SHIFT | vk::LSHIFT | vk::RSHIFT => Some(0),
+            vk::CONTROL | vk::LCONTROL | vk::RCONTROL => Some(1),
+            vk::MENU | vk::LMENU | vk::RMENU => Some(2),
+            _ => None,
+        };
+        if let Some(m) = modifier {
+            self.modifiers[m] = down;
+        }
+        if !down {
+            return;
+        }
+        self.press_vk(code);
+        let key = match code {
+            vk::TAB => Some(Key::Tab),
+            vk::BACK => Some(Key::Backspace),
+            vk::RETURN => Some(Key::Enter),
+            vk::SPACE => Some(Key::Space),
+            vk::ESCAPE => Some(Key::Escape),
+            vk::DELETE => Some(Key::Delete),
+            vk::LEFT => Some(Key::Left),
+            vk::RIGHT => Some(Key::Right),
+            vk::UP => Some(Key::Up),
+            vk::DOWN => Some(Key::Down),
+            vk::HOME => Some(Key::Home),
+            vk::END => Some(Key::End),
+            _ => None,
+        };
+        if let Some(k) = key {
+            self.push_key(k);
+        }
+    }
+    /// Select-all shortcut (Ctrl+A, ⌘A).
+    pub fn select_all(&mut self) {
+        self.push_key(Key::SelectAll);
+    }
+    /// Typed text; control characters are dropped.
+    pub fn text(&mut self, text: &str) {
+        for c in text.chars().filter(|c| !c.is_control()) {
+            if self.text.len() >= 64 {
+                break;
+            }
+            self.text.push(c);
+        }
+    }
+    /// Focus lost: held buttons and modifiers are released, nothing is hovered.
+    pub fn reset(&mut self) {
+        *self = Self::default();
+        self.leave();
+    }
+    fn push_key(&mut self, key: Key) {
+        if self.keys.len() < MAX_PRESSED {
+            self.keys.push(key);
+        }
+    }
     fn press_vk(&mut self, vk: u32) {
         if self.pressed_vk.len() < MAX_PRESSED && !self.pressed_vk.contains(&vk) {
             self.pressed_vk.push(vk);
         }
     }
-    /// Übersetzt eine Fensternachricht (Mausposition schon in Backbuffer-Pixeln).
+    /// Translates a window message (mouse position already in backbuffer pixels).
+    #[cfg(windows)]
     pub fn feed(&mut self, msg: u32, wparam: WPARAM, pixel: Option<(u32, u32)>) {
         if let Some((x, y)) = pixel {
-            self.mouse = [x as f32, y as f32];
+            self.pointer([x as f32, y as f32]);
         }
-        let button = match msg {
-            WM_LBUTTONDOWN | WM_LBUTTONDBLCLK | WM_LBUTTONUP => Some(0),
-            WM_RBUTTONDOWN | WM_RBUTTONDBLCLK | WM_RBUTTONUP => Some(1),
-            _ => None,
-        };
         match msg {
-            WM_LBUTTONDOWN | WM_LBUTTONDBLCLK | WM_RBUTTONDOWN | WM_RBUTTONDBLCLK => {
-                let b = button.unwrap_or(0);
-                self.down[b] = true;
-                self.pressed[b] = true;
-                self.press_vk(if b == 0 { 0x01 } else { 0x02 });
-            }
-            WM_LBUTTONUP | WM_RBUTTONUP => self.down[button.unwrap_or(0)] = false,
-            WM_MBUTTONDOWN | WM_MBUTTONDBLCLK => self.press_vk(u32::from(VK_MBUTTON)),
-            // HIWORD: XBUTTON1 = 1 (Maus 4), XBUTTON2 = 2 (Maus 5).
+            WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => self.button(0, true),
+            WM_RBUTTONDOWN | WM_RBUTTONDBLCLK => self.button(1, true),
+            WM_LBUTTONUP => self.button(0, false),
+            WM_RBUTTONUP => self.button(1, false),
+            WM_MBUTTONDOWN | WM_MBUTTONDBLCLK => self.button(2, true),
+            // HIWORD: XBUTTON1 = 1 (mouse 4), XBUTTON2 = 2 (mouse 5).
             WM_XBUTTONDOWN | WM_XBUTTONDBLCLK => match (wparam >> 16) as u16 {
-                1 => self.press_vk(u32::from(VK_XBUTTON1)),
-                2 => self.press_vk(u32::from(VK_XBUTTON2)),
+                1 => self.button(3, true),
+                2 => self.button(4, true),
                 _ => {}
             },
-            WM_MOUSEWHEEL => self.wheel += (wparam >> 16) as u16 as i16 as f32 / 120.0,
-            WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP => {
-                let vk = wparam as u16;
-                let down = matches!(msg, WM_KEYDOWN | WM_SYSKEYDOWN);
-                let modifier = match vk {
-                    VK_SHIFT | VK_LSHIFT | VK_RSHIFT => Some(0),
-                    VK_CONTROL | VK_LCONTROL | VK_RCONTROL => Some(1),
-                    VK_MENU | VK_LMENU | VK_RMENU => Some(2),
-                    _ => None,
-                };
-                if let Some(m) = modifier {
-                    self.modifiers[m] = down;
-                }
-                if !down {
-                    return;
-                }
-                self.press_vk(u32::from(vk));
-                let key = match vk {
-                    VK_TAB => Some(Key::Tab),
-                    VK_BACK => Some(Key::Backspace),
-                    VK_RETURN => Some(Key::Enter),
-                    VK_SPACE => Some(Key::Space),
-                    VK_ESCAPE => Some(Key::Escape),
-                    VK_DELETE => Some(Key::Delete),
-                    VK_LEFT => Some(Key::Left),
-                    VK_RIGHT => Some(Key::Right),
-                    VK_UP => Some(Key::Up),
-                    VK_DOWN => Some(Key::Down),
-                    VK_HOME => Some(Key::Home),
-                    VK_END => Some(Key::End),
-                    _ => None,
-                };
-                if let Some(k) = key
-                    && self.keys.len() < MAX_PRESSED
-                {
-                    self.keys.push(k);
-                }
-            }
+            WM_MOUSEWHEEL => self.wheel((wparam >> 16) as u16 as i16 as f32 / 120.0),
+            WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP => self.key(
+                u32::from(wparam as u16),
+                matches!(msg, WM_KEYDOWN | WM_SYSKEYDOWN),
+            ),
             // Ctrl+A arrives as the control character 0x01 after TranslateMessage.
-            WM_CHAR if wparam == 0x01 => self.keys.push(Key::SelectAll),
+            WM_CHAR if wparam == 0x01 => self.select_all(),
             WM_CHAR => {
-                if let Some(c) = char::from_u32(wparam as u32).filter(|c| !c.is_control())
-                    && self.text.len() < 64
-                {
-                    self.text.push(c);
+                if let Some(c) = char::from_u32(wparam as u32) {
+                    self.text(c.encode_utf8(&mut [0; 4]));
                 }
             }
             _ => {}
@@ -135,6 +221,37 @@ impl Collector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn platform_neutral_events() {
+        let mut c = Collector::default();
+        c.pointer([10.0, 20.0]);
+        c.button(0, true);
+        c.button(0, false);
+        c.button(3, true);
+        c.key(vk::LSHIFT, true);
+        c.key(vk::LEFT, true);
+        c.key(0x41, true);
+        c.select_all();
+        c.text("a\u{8}b");
+        c.wheel(-0.5);
+        let first = c.take();
+        assert_eq!(first.mouse, [10.0, 20.0]);
+        assert!(first.down[0] && first.shift && !first.ctrl);
+        assert_eq!(first.keys, vec![Key::Left, Key::SelectAll]);
+        assert_eq!(first.text, "ab");
+        assert_eq!(first.wheel, -0.5);
+        assert_eq!(first.pressed_vk, vec![0x01, 0x05, 0xA0, 0x25, 0x41]);
+        c.reset();
+        let second = c.take();
+        assert!(!second.down[0] && !second.shift && second.mouse == [-1.0, -1.0]);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod win_tests {
+    use super::*;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 
     #[test]
     fn collector_keeps_clicks_within_one_frame_and_text() {

@@ -1,8 +1,8 @@
 # poly-ui
 
-A standalone Windows window for the poly UI kit: the same shell, widgets, theme and D3D11 renderer as the poly menu, in a borderless, per-pixel transparent window.
+A standalone window for the poly UI kit: the same shell, widgets, theme and Liquid Glass look as the poly menu, in a borderless, per-pixel transparent window. On Windows it is Win32 + D3D11 + DirectComposition, on macOS AppKit + Metal.
 
-```powershell
+```sh
 cargo run -p poly-ui-app --release
 ```
 
@@ -10,8 +10,8 @@ cargo run -p poly-ui-app --release
 
 | Path | Contents |
 | --- | --- |
-| `ui/` | `poly-ui`: immediate-mode kit (widgets, window shell, gallery), theme, draw lists, anti-aliased primitives, font, D3D11 renderer, Win32 input collector |
-| `ui-app/` | `poly-ui-app.exe`: window creation, D3D11 + DirectComposition swapchain, message loop, test page |
+| `ui/` | `poly-ui`: immediate-mode kit (widgets, window shell, gallery), theme, draw lists, anti-aliased primitives, font, D3D11 renderer (Windows), Metal renderer (macOS), input collector |
+| `ui-app/` | `poly-ui-app`: test page and hit testing shared by both hosts; `win/` window creation, D3D11 + DirectComposition swapchain, message loop; `mac/` NSWindow, `CAMetalLayer`, display link, key mapping |
 
 ## The window
 
@@ -23,11 +23,18 @@ cargo run -p poly-ui-app --release
 
 Known limit: clicks on the transparent shadow outside the resize band are swallowed instead of reaching the window behind.
 
+### macOS
+
+- Borderless, transparent `NSWindow` without its own shadow; the content view hosts a `CAMetalLayer` (sRGB colour space, `framebufferOnly` off so the glass can blur the drawable), drawn on every display-link tick.
+- The Metal renderer runs the same shaders and glass blur (¼ downsample, separable Gaussian) as D3D11, so both platforms look the same.
+- Title bar drags through `performWindowDragWithEvent` (tiling, Spaces); double-click follows the system's title-bar setting. Edges, corners and the grip resize the window, with the system resize cursors; the shell redraws in step with the frame.
+- Keys arrive as Windows virtual-key codes (layout-independent `kVK_*` mapping), ⌥ is Alt, ⌘A / ⌃A select all, ⌘Q quits, ⌘H hides, ⌘M minimises; trackpad scrolling is smooth.
+
 ## Build and check
 
-Windows x64 (MSVC), Rust 1.96 or newer.
+Windows x64 (MSVC) or macOS 11+ (Apple Silicon or Intel), Rust 1.96 or newer.
 
-```powershell
+```sh
 cargo build --release --locked
 cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings

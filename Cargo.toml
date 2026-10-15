@@ -9,6 +9,14 @@ rust-version = "1.96"
 [workspace.dependencies]
 windows-sys = "0.61.2"
 windows = { version = "0.62.2", default-features = false }
+objc2 = "0.6.5"
+block2 = "0.6.2"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std"] }
+objc2-metal = { version = "0.3.2", default-features = false, features = ["std"] }
+objc2-quartz-core = { version = "0.3.2", default-features = false, features = ["std"] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std"] }
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std"] }
 
 [workspace.lints.clippy]
 undocumented_unsafe_blocks = "deny"

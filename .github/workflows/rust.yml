@@ -17,3 +17,15 @@ jobs:
         run: cargo +1.96.0-x86_64-pc-windows-msvc clippy --workspace --all-targets --locked -- -D warnings
       - name: Format
         run: cargo +1.96.0-x86_64-pc-windows-msvc fmt --all --check
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install 1.96.0 --profile minimal --component rustfmt --component clippy
+      - name: Check
+        run: cargo +1.96.0 check --workspace --all-targets --locked
+      - name: Test (Metal)
+        run: cargo +1.96.0 test --workspace --locked
+      - name: Clippy
+        run: cargo +1.96.0 clippy --workspace --all-targets --locked -- -D warnings

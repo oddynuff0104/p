@@ -132,7 +132,8 @@ impl Gpu {
         // SAFETY: The view is owned and live; the colour array outlives the call.
         unsafe { self.context.ClearRenderTargetView(&rtv, &[0.0; 4]) };
         drop(rtv);
-        self.renderer.paint(&buffer, textures, backdrop, self.size)?;
+        self.renderer
+            .paint(&buffer, textures, backdrop, self.size)?;
         self.renderer.paint(&buffer, &[], list, self.size)?;
         drop(buffer);
         // SAFETY: The swapchain is live; presenting needs no other arguments.

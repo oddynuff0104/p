@@ -337,13 +337,19 @@ fn toast_and_confirm_dialog() {
     assert_eq!(h.kit.toast_count(), 0, "expires");
 }
 
-/// Rounded rect on WARP: interior opaque, a half-covered edge pixel about half, the
-/// corner curve has intermediate coverage, outside untouched.
+/// Rounded rect on the offscreen GPU target (WARP on Windows, Metal on macOS): interior
+/// opaque, a half-covered edge pixel about half, the corner curve has intermediate
+/// coverage, outside untouched.
+#[cfg(any(windows, target_os = "macos"))]
 #[test]
-fn rounded_rect_edge_coverage_on_warp() {
+fn rounded_rect_edge_coverage_on_gpu() {
+    #[cfg(windows)]
+    use crate::d3d11::Offscreen;
     use crate::draw::{DrawList, FONT_TEXTURE, TextureDelta};
+    #[cfg(target_os = "macos")]
+    use crate::metal::Offscreen;
     use crate::primitives::Shapes;
-    let mut target = crate::d3d11::Offscreen::new(64, 64).unwrap();
+    let mut target = Offscreen::new(64, 64).unwrap();
     target.clear([0.0, 0.0, 0.0, 1.0]);
     let mut list = DrawList::default();
     list.fill_rounded(Rect::new(10.5, 10.0, 40.0, 40.0), 12.0, Color::WHITE.pm());
