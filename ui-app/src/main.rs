@@ -105,8 +105,8 @@ impl App {
         input.dt = dt;
         let margin = self.margin();
         let result = self.gpu.resize(self.size).and_then(|()| {
-            let (list, textures, close) = self.page.frame(input, self.size, margin);
-            self.gpu.frame(&textures, list).map(|()| close)
+            let (backdrop, list, textures, close) = self.page.frame(input, self.size, margin);
+            self.gpu.frame(&textures, backdrop, list).map(|()| close)
         });
         match result {
             // SAFETY: Posting to our own live window; the message carries no pointers.

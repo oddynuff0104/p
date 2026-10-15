@@ -1,5 +1,6 @@
 //! Design system of the menu kit (`menu::kit`): every colour, size, radius, font size,
-//! shadow and animation speed in one place.
+//! shadow and animation speed in one place. The look is dark "liquid glass" with an
+//! accent [`Gradient`] (docs/UI.md, "Aussehen: Liquid Glass").
 //!
 //! Metrics are in points; [`Theme::px`] multiplies by the DPI `scale` and rounds to whole
 //! physical pixels so edges stay crisp. Colours are straight (non-premultiplied) sRGB
@@ -12,7 +13,6 @@ use super::draw::rgba;
 pub struct Color(pub [u8; 4]);
 
 impl Color {
-    pub const TRANSPARENT: Color = Color([0, 0, 0, 0]);
     pub const WHITE: Color = Color([255, 255, 255, 255]);
     pub const BLACK: Color = Color([0, 0, 0, 255]);
 
@@ -103,7 +103,8 @@ impl Color {
     }
 }
 
-/// Selectable accent colours (Settings › Appearance); index 0 is the default.
+/// Single accent colours: colour-picker presets and the migration of old window files
+/// (`accent=<index>` before gradients); index 0 was the default.
 pub const ACCENTS: [(&str, Color); 6] = [
     ("Indigo", Color::rgb(108, 124, 255)),
     ("Sky", Color::rgb(56, 170, 255)),
@@ -112,6 +113,239 @@ pub const ACCENTS: [(&str, Color); 6] = [
     ("Rose", Color::rgb(255, 92, 132)),
     ("Amber", Color::rgb(255, 170, 50)),
 ];
+
+/// Gradient presets of Settings › Appearance (index 0 is the default). "Single colour"
+/// is not listed here: it is a gradient with one stop.
+pub const GRADIENTS: [(&str, &[Color]); 5] = [
+    (
+        "Rainbow",
+        &[
+            Color::rgb(255, 77, 109),
+            Color::rgb(255, 159, 67),
+            Color::rgb(255, 210, 63),
+            Color::rgb(61, 220, 151),
+            Color::rgb(58, 176, 255),
+            Color::rgb(142, 107, 255),
+        ],
+    ),
+    (
+        "Sunset",
+        &[
+            Color::rgb(255, 79, 129),
+            Color::rgb(255, 128, 82),
+            Color::rgb(255, 196, 102),
+        ],
+    ),
+    (
+        "Ocean",
+        &[
+            Color::rgb(0, 210, 255),
+            Color::rgb(0, 122, 255),
+            Color::rgb(108, 92, 255),
+        ],
+    ),
+    (
+        "Aurora",
+        &[
+            Color::rgb(61, 220, 151),
+            Color::rgb(34, 211, 238),
+            Color::rgb(167, 139, 250),
+            Color::rgb(244, 114, 182),
+        ],
+    ),
+    (
+        "Neon",
+        &[
+            Color::rgb(247, 37, 133),
+            Color::rgb(144, 60, 230),
+            Color::rgb(67, 97, 238),
+            Color::rgb(76, 201, 240),
+        ],
+    ),
+];
+
+/// The accent: 1–6 colour stops (1 = a plain single colour), an angle and an optional
+/// slow hue rotation. Drawn through a 256-texel lookup row ([`Gradient::lut`]), so any
+/// shape can be filled with it without extra draw calls.
+#[derive(Clone, Copy, Debug)]
+pub struct Gradient {
+    pub stops: [Color; Gradient::MAX_STOPS],
+    /// Used stops, 1..=MAX_STOPS.
+    pub count: usize,
+    /// CSS-style degrees: 0 = left → right, 90 = top → bottom.
+    pub angle: f32,
+    /// Hue rotation in degrees per second; 0 = static.
+    pub hue_speed: f32,
+}
+
+impl Default for Gradient {
+    fn default() -> Self {
+        Self::preset(0)
+    }
+}
+
+/// Equal when the used stops, angle and speed are (unused stop slots do not count).
+impl PartialEq for Gradient {
+    fn eq(&self, o: &Self) -> bool {
+        self.stops() == o.stops() && self.angle == o.angle && self.hue_speed == o.hue_speed
+    }
+}
+
+impl Gradient {
+    pub const MAX_STOPS: usize = 6;
+    pub const DEFAULT_ANGLE: f32 = 20.0;
+    pub const MAX_HUE_SPEED: f32 = 120.0;
+
+    /// Preset `i` of [`GRADIENTS`] (clamped).
+    pub fn preset(i: usize) -> Self {
+        let (_, stops) = GRADIENTS[i.min(GRADIENTS.len() - 1)];
+        let mut g = Self::single(stops[0]);
+        g.set_stops(stops);
+        g
+    }
+
+    pub fn single(color: Color) -> Self {
+        Self {
+            stops: [color; Self::MAX_STOPS],
+            count: 1,
+            angle: Self::DEFAULT_ANGLE,
+            hue_speed: 0.0,
+        }
+    }
+
+    pub fn stops(&self) -> &[Color] {
+        &self.stops[..self.count.clamp(1, Self::MAX_STOPS)]
+    }
+
+    /// Uses `stops` (at most [`Self::MAX_STOPS`], at least one).
+    pub fn set_stops(&mut self, stops: &[Color]) {
+        if stops.is_empty() {
+            return;
+        }
+        let n = stops.len().min(Self::MAX_STOPS);
+        self.stops[..n].copy_from_slice(&stops[..n]);
+        self.count = n;
+    }
+
+    /// Changes the number of stops; new stops continue the hue walk of the last ones.
+    pub fn set_count(&mut self, count: usize) {
+        let count = count.clamp(1, Self::MAX_STOPS);
+        for i in self.count..count {
+            let last = self.stops[i.saturating_sub(1)];
+            let [h, s, v] = last.to_hsv();
+            self.stops[i] = Color::from_hsv(h + 0.13, s.max(0.55), v.max(0.85));
+        }
+        self.count = count;
+    }
+
+    /// Index into [`GRADIENTS`] whose stops equal ours, if any.
+    pub fn preset_index(&self) -> Option<usize> {
+        GRADIENTS.iter().position(|(_, s)| *s == self.stops())
+    }
+
+    /// Hue rotation (0..1) at kit time `time` seconds.
+    pub fn phase(&self, time: f32) -> f32 {
+        (time * self.hue_speed / 360.0).rem_euclid(1.0)
+    }
+
+    /// Colour at `t` (0..1) with the hue rotated by `phase` turns; stops are blended in
+    /// linear light so mid tones stay bright.
+    pub fn sample(&self, t: f32, phase: f32) -> Color {
+        let stops = self.stops();
+        let c = if stops.len() == 1 {
+            stops[0]
+        } else {
+            let x = t.clamp(0.0, 1.0) * (stops.len() - 1) as f32;
+            let i = (x.floor() as usize).min(stops.len() - 2);
+            mix_linear(stops[i], stops[i + 1], x - i as f32)
+        };
+        if phase == 0.0 {
+            return c;
+        }
+        let [h, s, v] = c.to_hsv();
+        Color::from_hsv(h + phase, s, v)
+    }
+
+    /// Mean colour (icons, text and other places that cannot show a gradient).
+    pub fn average(&self, phase: f32) -> Color {
+        let n = 8;
+        let sum = (0..n).fold([0.0f32; 3], |acc, i| {
+            let c = self.sample(i as f32 / (n - 1) as f32, phase);
+            [
+                acc[0] + to_linear(c.0[0]),
+                acc[1] + to_linear(c.0[1]),
+                acc[2] + to_linear(c.0[2]),
+            ]
+        });
+        let q = |v: f32| to_srgb(v / n as f32);
+        Color::rgb(q(sum[0]), q(sum[1]), q(sum[2]))
+    }
+
+    /// The 256×1 premultiplied lookup row (`draw::GRADIENT_TEXTURE`).
+    pub fn lut(&self, phase: f32) -> Vec<u8> {
+        let w = super::draw::GRADIENT_WIDTH as usize;
+        let mut out = Vec::with_capacity(w * 4);
+        for i in 0..w {
+            let c = self.sample(i as f32 / (w - 1) as f32, phase);
+            out.extend_from_slice(&[c.0[0], c.0[1], c.0[2], 255]);
+        }
+        out
+    }
+
+    /// `#RRGGBB,#RRGGBB,…` (window file).
+    pub fn stops_text(&self) -> String {
+        self.stops()
+            .iter()
+            .map(|c| c.to_hex())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// Parses [`Self::stops_text`]; `None` when no stop parses.
+    pub fn parse_stops(text: &str) -> Option<Vec<Color>> {
+        let stops: Vec<Color> = text
+            .split(',')
+            .filter_map(Color::parse_hex)
+            .take(Self::MAX_STOPS)
+            .collect();
+        (!stops.is_empty()).then_some(stops)
+    }
+}
+
+fn to_linear(c: u8) -> f32 {
+    let c = c as f32 / 255.0;
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn to_srgb(v: f32) -> u8 {
+    let v = v.clamp(0.0, 1.0);
+    let s = if v <= 0.003_130_8 {
+        v * 12.92
+    } else {
+        1.055 * v.powf(1.0 / 2.4) - 0.055
+    };
+    (s * 255.0).round() as u8
+}
+
+fn mix_linear(a: Color, b: Color, t: f32) -> Color {
+    let m = |x: u8, y: u8| to_srgb(to_linear(x) + (to_linear(y) - to_linear(x)) * t);
+    Color::rgb(m(a.0[0], b.0[0]), m(a.0[1], b.0[1]), m(a.0[2], b.0[2]))
+}
+
+/// How a glass surface is drawn (`Kit::glass`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GlassKind {
+    /// The window: blurred backdrop, dark tint, gradient rim and glow.
+    Window,
+    /// Popups, dropdowns, dialogs, tooltips, toasts: denser tint, deeper shadow.
+    Popup,
+    /// Cards and the sidebar inside the window: a light platter with a lit rim.
+    Platter,
+}
 
 /// Corner radii in points.
 #[derive(Clone, Copy, Debug)]
@@ -151,17 +385,29 @@ pub struct Shadow {
 pub struct Theme {
     /// DPI factor (physical pixels per point).
     pub scale: f32,
-    // Semantic colour tokens.
-    pub bg: Color,
-    pub surface: Color,
-    pub surface_raised: Color,
-    pub surface_hover: Color,
+    // Semantic colour tokens (surfaces are glass: see `glass_*`, `platter`).
     pub border: Color,
     pub border_strong: Color,
     pub text: Color,
     pub text_muted: Color,
     pub text_faint: Color,
+    /// Mean colour of the accent gradient (text, icons; kept current by the kit).
     pub accent: Color,
+    /// The accent gradient (fills, rims, glow).
+    pub gradient: Gradient,
+    /// Hue rotation of the gradient this frame (0..1, from `gradient.hue_speed`).
+    pub phase: f32,
+    /// Real backdrop blur behind glass (else layered translucency only).
+    pub blur: bool,
+    /// Glass tint over the blurred backdrop (window / popups) with blur on and off.
+    pub glass_tint: Color,
+    pub glass_alpha: [f32; 2],
+    pub popup_alpha: [f32; 2],
+    /// Light platter of cards and the sidebar inside the window.
+    pub platter: Color,
+    /// Specular rim: the lit (top/left) and the shaded (bottom/right) edge.
+    pub rim_light: Color,
+    pub rim_shade: Color,
     /// Text and icons on an accent fill.
     pub on_accent: Color,
     pub danger: Color,
@@ -182,36 +428,50 @@ pub struct Theme {
     pub control: f32,
     /// Exponential approach rate of animations per second (higher = snappier).
     pub anim_rate: f32,
+    /// Spring of hover/press/toggle motion: stiffness (1/s²) and damping ratio (< 1
+    /// overshoots slightly; settles in about a quarter second).
+    pub spring: [f32; 2],
     /// Hover time before a tooltip shows, seconds.
     pub tooltip_delay: f32,
 }
 
 impl Theme {
-    /// The dark default theme with `accent`.
+    /// The dark glass theme with a single-colour `accent`.
+    #[cfg(test)]
     pub fn dark(accent: Color, scale: f32) -> Self {
+        Self::glass(Gradient::single(accent), scale)
+    }
+
+    /// The dark glass theme with the accent `gradient`.
+    pub fn glass(gradient: Gradient, scale: f32) -> Self {
         Self {
             scale: scale.max(0.5),
-            bg: Color::rgba(13, 14, 19, 246),
-            surface: Color::rgb(21, 23, 30),
-            surface_raised: Color::rgb(29, 32, 41),
-            surface_hover: Color::rgb(37, 41, 52),
-            border: Color::rgb(39, 43, 54),
-            border_strong: Color::rgb(56, 61, 76),
-            text: Color::rgb(232, 234, 240),
-            text_muted: Color::rgb(148, 154, 170),
-            text_faint: Color::rgb(98, 104, 120),
-            accent,
+            border: Color::rgba(255, 255, 255, 22),
+            border_strong: Color::rgba(255, 255, 255, 40),
+            text: Color::rgb(242, 244, 250),
+            text_muted: Color::rgb(176, 182, 198),
+            text_faint: Color::rgb(128, 134, 152),
+            accent: gradient.average(0.0),
+            gradient,
+            phase: 0.0,
+            blur: true,
+            glass_tint: Color::rgb(11, 13, 22),
+            glass_alpha: [0.56, 0.90],
+            popup_alpha: [0.70, 0.94],
+            platter: Color::rgba(255, 255, 255, 12),
+            rim_light: Color::rgba(255, 255, 255, 92),
+            rim_shade: Color::rgba(255, 255, 255, 16),
             on_accent: Color::WHITE,
-            danger: Color::rgb(240, 86, 96),
-            success: Color::rgb(52, 196, 120),
-            warning: Color::rgb(240, 176, 60),
-            scrim: Color::rgba(5, 6, 9, 150),
+            danger: Color::rgb(255, 92, 102),
+            success: Color::rgb(60, 214, 132),
+            warning: Color::rgb(255, 186, 70),
+            scrim: Color::rgba(5, 6, 9, 140),
             space: [2.0, 4.0, 8.0, 12.0, 16.0, 24.0, 32.0],
             radius: Radii {
-                sm: 4.0,
-                md: 6.0,
-                lg: 10.0,
-                xl: 14.0,
+                sm: 6.0,
+                md: 10.0,
+                lg: 16.0,
+                xl: 24.0,
             },
             type_scale: TypeScale {
                 caption: 11.5,
@@ -220,25 +480,41 @@ impl Theme {
                 title: 18.0,
             },
             shadow_card: Shadow {
-                offset: [0.0, 2.0],
-                blur: 10.0,
-                color: Color::rgba(0, 0, 0, 70),
+                offset: [0.0, 3.0],
+                blur: 14.0,
+                color: Color::rgba(0, 0, 0, 46),
             },
             shadow_popup: Shadow {
-                offset: [0.0, 6.0],
-                blur: 18.0,
-                color: Color::rgba(0, 0, 0, 120),
+                offset: [0.0, 10.0],
+                blur: 30.0,
+                color: Color::rgba(0, 0, 0, 130),
             },
             shadow_window: Shadow {
-                offset: [0.0, 10.0],
-                blur: 36.0,
-                color: Color::rgba(0, 0, 0, 150),
+                offset: [0.0, 18.0],
+                blur: 56.0,
+                color: Color::rgba(0, 0, 0, 140),
             },
             row: 32.0,
             control: 28.0,
             anim_rate: 18.0,
+            spring: [420.0, 0.72],
             tooltip_delay: 0.45,
         }
+    }
+
+    /// Glass tint alpha of `kind` for the current blur setting.
+    pub fn tint_alpha(&self, kind: GlassKind) -> f32 {
+        let i = usize::from(!self.blur);
+        match kind {
+            GlassKind::Window => self.glass_alpha[i],
+            GlassKind::Popup => self.popup_alpha[i],
+            GlassKind::Platter => self.platter.0[3] as f32 / 255.0,
+        }
+    }
+
+    /// Accent colour for text and icons: the mean, lifted for contrast on dark glass.
+    pub fn accent_text(&self) -> Color {
+        self.accent.mix(Color::WHITE, 0.35)
     }
 
     /// Points → whole physical pixels.
@@ -262,15 +538,11 @@ impl Theme {
             TextStyle::Title => t.title,
         }
     }
-    /// Accent mixed toward the surface (tinted backgrounds of active items).
-    pub fn accent_soft(&self) -> Color {
-        self.surface.mix(self.accent, 0.22)
-    }
 }
 
 impl Default for Theme {
     fn default() -> Self {
-        Self::dark(ACCENTS[0].1, 1.0)
+        Self::glass(Gradient::default(), 1.0)
     }
 }
 
@@ -298,6 +570,29 @@ mod tests {
                 assert!(back.0[i].abs_diff(c.0[i]) <= 1, "{c:?} -> {back:?}");
             }
         }
+    }
+
+    #[test]
+    fn gradient_samples_stops_and_round_trips() {
+        let g = Gradient::preset(1);
+        assert_eq!(g.sample(0.0, 0.0), GRADIENTS[1].1[0]);
+        assert_eq!(g.sample(1.0, 0.0), *GRADIENTS[1].1.last().unwrap());
+        assert_eq!(g.preset_index(), Some(1));
+        let parsed = Gradient::parse_stops(&g.stops_text()).unwrap();
+        assert_eq!(parsed, g.stops());
+        assert_eq!(Gradient::parse_stops("junk,#zz"), None);
+        let single = Gradient::single(Color::rgb(10, 200, 90));
+        assert_eq!(single.sample(0.7, 0.0), Color::rgb(10, 200, 90));
+        assert_eq!(single.lut(0.0).len(), 256 * 4);
+        // Hue rotation by half a turn moves red to cyan.
+        let red = Gradient::single(Color::rgb(255, 0, 0)).sample(0.5, 0.5);
+        assert_eq!(red, Color::rgb(0, 255, 255));
+        let mut g = Gradient::single(Color::rgb(255, 0, 0));
+        g.set_count(4);
+        assert_eq!(g.stops().len(), 4);
+        assert_ne!(g.stops[1], g.stops[0], "new stops walk the hue");
+        g.set_count(99);
+        assert_eq!(g.count, Gradient::MAX_STOPS);
     }
 
     #[test]

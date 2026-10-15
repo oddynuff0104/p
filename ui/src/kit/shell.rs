@@ -13,8 +13,8 @@
 
 use super::{Id, Kit, hash};
 use crate::draw::Rect;
-use crate::primitives::{Corners, Icon, Shapes};
-use crate::theme::{Color, TextStyle};
+use crate::primitives::{Icon, Shapes};
+use crate::theme::{ACCENTS, Color, GlassKind, Gradient, TextStyle};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct WindowState {
@@ -24,8 +24,10 @@ pub struct WindowState {
     pub size: [f32; 2],
     pub sidebar_collapsed: bool,
     pub page: usize,
-    /// Index into `theme::ACCENTS`.
-    pub accent: usize,
+    /// Accent gradient (Settings › Appearance).
+    pub gradient: Gradient,
+    /// Real backdrop blur behind the glass.
+    pub blur: bool,
 }
 
 impl Default for WindowState {
@@ -35,7 +37,8 @@ impl Default for WindowState {
             size: [1020.0, 700.0],
             sidebar_collapsed: false,
             page: 0,
-            accent: 0,
+            gradient: Gradient::default(),
+            blur: true,
         }
     }
 }
@@ -49,22 +52,35 @@ impl WindowState {
         if let Some([x, y]) = self.pos {
             s += &format!("x={x:.0}\ny={y:.0}\n");
         }
+        let g = &self.gradient;
         s += &format!(
-            "w={:.0}\nh={:.0}\nsidebar_collapsed={}\npage={}\naccent={}\n",
-            self.size[0], self.size[1], self.sidebar_collapsed, self.page, self.accent
+            "w={:.0}\nh={:.0}\nsidebar_collapsed={}\npage={}\ngradient={}\n\
+             gradient_angle={:.0}\nhue_shift={:.0}\nblur={}\n",
+            self.size[0],
+            self.size[1],
+            self.sidebar_collapsed,
+            self.page,
+            g.stops_text(),
+            g.angle,
+            g.hue_speed,
+            self.blur
         );
         s
     }
 
     /// Parses [`Self::to_text`]; unknown keys and bad values fall back to defaults.
+    /// Files from before gradients (`accent=<index>`) keep their chosen colour as a
+    /// single-colour accent; the old default (index 0) becomes the default gradient.
     pub fn from_text(text: &str) -> Self {
         let mut st = Self::default();
         let (mut x, mut y) = (None, None);
+        let (mut stops, mut legacy) = (None, None);
         for line in text.lines() {
             let Some((k, v)) = line.split_once('=') else {
                 continue;
             };
             let f = v.trim().parse::<f32>().ok().filter(|f| f.is_finite());
+            let g = &mut st.gradient;
             match k.trim() {
                 "x" => x = f,
                 "y" => y = f,
@@ -72,9 +88,27 @@ impl WindowState {
                 "h" => st.size[1] = f.unwrap_or(st.size[1]),
                 "sidebar_collapsed" => st.sidebar_collapsed = v.trim() == "true",
                 "page" => st.page = v.trim().parse().unwrap_or(0),
-                "accent" => st.accent = v.trim().parse().unwrap_or(0),
+                "accent" => legacy = v.trim().parse::<usize>().ok(),
+                "gradient" => stops = Gradient::parse_stops(v),
+                "gradient_angle" => g.angle = f.map_or(g.angle, |a| a.rem_euclid(360.0)),
+                "hue_shift" => {
+                    g.hue_speed = f.map_or(g.hue_speed, |s| s.clamp(0.0, Gradient::MAX_HUE_SPEED))
+                }
+                "blur" => st.blur = v.trim() != "false",
                 _ => {}
             }
+        }
+        match (stops, legacy) {
+            (Some(stops), _) => st.gradient.set_stops(&stops),
+            (None, Some(i)) if i > 0 && i < ACCENTS.len() => {
+                let g = Gradient::single(ACCENTS[i].1);
+                st.gradient = Gradient {
+                    angle: st.gradient.angle,
+                    hue_speed: st.gradient.hue_speed,
+                    ..g
+                };
+            }
+            _ => {}
         }
         st.pos = x.zip(y).map(|(x, y)| [x, y]);
         st.size = [st.size[0].max(Self::MIN[0]), st.size[1].max(Self::MIN[1])];
@@ -196,17 +230,7 @@ impl Shell {
         self.window = win;
         kit.modal_area = Some(win);
         let radius = t.pxf(t.radius.xl);
-        let sh = t.shadow_window;
-        let dl = kit.dl();
-        dl.shadow(
-            win,
-            radius,
-            t.pxf(sh.blur),
-            [0.0, t.pxf(sh.offset[1])],
-            sh.color.pm(),
-        );
-        dl.fill_rounded(win, radius, t.bg.pm());
-        dl.stroke_rounded(win, radius, 1.0, t.border.pm());
+        kit.glass(win, radius, GlassKind::Window, 1.0);
         let wid = kit.id("##window");
 
         // ---------------------------------------------------------- title bar
@@ -227,14 +251,16 @@ impl Shell {
         if drag.pressed && self.host.is_none() {
             self.drag = Some([m[0] - win.min[0], m[1] - win.min[1]]);
         }
-        let cy = bar.min[1] + title_h / 2.0;
-        // Logo: accent pill with a dot, then "poly".
+        let cy = bar.min[1] + title_h / 2.0 + t.px(2.0);
+        // Logo: gradient tile with a glass sheen and a dot, then "poly".
         let lx = bar.min[0] + t.sp(5);
         let logo = Rect::new(lx, (cy - t.px(11.0)).round(), t.px(22.0), t.px(22.0));
-        let top = t.accent.mix(Color::WHITE, 0.15).pm();
-        let bottom = t.accent.mix(Color::BLACK, 0.15).pm();
-        kit.dl()
-            .gradient_rounded(logo, t.pxf(t.radius.md), top, bottom);
+        let lr = t.pxf(7.0);
+        kit.grad_glow(logo, lr, t.pxf(6.0), 0.35);
+        kit.grad_fill(logo, lr, 1.0, logo);
+        let sheen = Color::WHITE.alpha(0.28).pm();
+        kit.dl().gradient_rounded(logo, lr, sheen, 0);
+        kit.lit_rim(logo, lr, 1.0);
         kit.dl().circle(
             [logo.min[0] + logo.width() / 2.0, cy],
             t.px(4.0),
@@ -249,43 +275,36 @@ impl Shell {
         kit.text_fit(TextStyle::Body, x, cy, page_title, max, t.text_muted);
         let close = kit.interact(hash(wid, "close"), close_r, true);
         let hv = kit.anim_bool(hash(wid, "close_h"), close.hovered);
-        let bg = t.danger.alpha(0.85 * hv).pm();
-        kit.dl().fill_rounded(close_r, t.pxf(t.radius.md), bg);
+        let press = kit.spring_bool(hash(wid, "close_p"), close.held);
+        let cc = [close_r.min[0] + close_r.width() / 2.0, cy];
+        let cr = t.px(13.0) * (1.0 - 0.08 * press);
+        kit.dl()
+            .circle(cc, cr, Color::WHITE.alpha(0.07 * (1.0 - hv)).pm());
+        kit.dl().circle(cc, cr, t.danger.alpha(0.9 * hv).pm());
         let ic = t.text_muted.mix(Color::WHITE, hv);
-        kit.icon(
-            Icon::Close,
-            [close_r.min[0] + close_r.width() / 2.0, cy],
-            14.0,
-            ic,
-        );
-        kit.focus_ring(hash(wid, "close"), close_r, t.pxf(t.radius.md));
-        kit.dl().rect(
-            Rect::new(bar.min[0], bar.max[1] - 1.0, bar.width(), 1.0),
-            t.border.pm(),
-        );
+        kit.icon(Icon::Close, cc, 13.0, ic);
+        kit.focus_ring(hash(wid, "close"), close_r, close_r.width() / 2.0);
 
         // ---------------------------------------------------------- sidebar
         let collapsed = self.state.sidebar_collapsed;
-        let k = kit.anim_bool(hash(wid, "collapse"), collapsed);
-        let side_w = (t.px(196.0) + (t.px(60.0) - t.px(196.0)) * k).round();
+        let k = kit.spring_bool(hash(wid, "collapse"), collapsed);
+        let side_w = (t.px(188.0) + (t.px(56.0) - t.px(188.0)) * k).round();
         let footer_h = t.px(30.0);
+        let inset = t.sp(2);
+        // A floating glass platter inset from the window edges.
         let side = Rect {
-            min: [win.min[0], bar.max[1]],
-            max: [win.min[0] + side_w, win.max[1] - footer_h],
+            min: [win.min[0] + inset, bar.max[1]],
+            max: [win.min[0] + inset + side_w, win.max[1] - footer_h],
         };
-        let side_bg = t.bg.mix(Color::BLACK, 0.25).pm();
-        kit.dl().fill_rounded(side, 0.0, side_bg);
-        kit.dl().rect(
-            Rect::new(side.max[0] - 1.0, side.min[1], 1.0, side.height()),
-            t.border.pm(),
-        );
+        kit.glass(side, t.pxf(t.radius.lg), GlassKind::Platter, 1.0);
         let item_h = t.px(38.0);
-        let pad = t.sp(2);
+        let pad = t.sp(1) + t.px(2.0);
         let mut page_changed = false;
-        let mut y = side.min[1] + t.sp(3);
-        let active_y = side.min[1] + t.sp(3) + item_h * self.state.page as f32;
-        let ind_y = kit.anim(hash(wid, "ind"), active_y);
-        // Active indicator: tinted pill + accent bar, sliding between items.
+        let mut y = side.min[1] + t.sp(2);
+        let active_y = side.min[1] + t.sp(2) + item_h * self.state.page as f32;
+        let ind_y = kit.spring(hash(wid, "ind"), active_y);
+        // Active indicator: a gradient pill with a lit rim and a soft glow, sliding
+        // (springy) between items.
         let ind = Rect::new(
             side.min[0] + pad,
             ind_y,
@@ -293,15 +312,11 @@ impl Shell {
             item_h - t.px(4.0),
         );
         if !nav.is_empty() {
-            kit.dl()
-                .fill_rounded(ind, t.pxf(t.radius.md), t.accent_soft().pm());
-            let bar_r = Rect::new(
-                side.min[0] + pad,
-                ind_y + t.px(8.0),
-                t.px(3.0),
-                item_h - t.px(20.0),
-            );
-            kit.dl().fill_rounded(bar_r, t.px(1.5), t.accent.pm());
+            let r = t.pxf(t.radius.md);
+            kit.grad_glow(ind, r, t.pxf(8.0), 0.22);
+            kit.grad_fill(ind, r, 0.42, ind);
+            kit.grad_stroke(ind, r, 1.0, 0.75, ind);
+            kit.lit_rim(ind.shrink(1.0), r - 1.0, 0.6);
         }
         for (i, item) in nav.iter().enumerate() {
             let r = Rect::new(side.min[0] + pad, y, side_w - 2.0 * pad, item_h - t.px(4.0));
@@ -315,11 +330,11 @@ impl Shell {
             let active = self.state.page == i;
             let hv = kit.anim_bool(hash(id, "h"), resp.hovered && !active);
             kit.dl()
-                .fill_rounded(r, t.pxf(t.radius.md), t.surface_hover.alpha(hv * 0.7).pm());
+                .fill_rounded(r, t.pxf(t.radius.md), Color::WHITE.alpha(hv * 0.07).pm());
             let icy = r.min[1] + r.height() / 2.0;
-            let ix = r.min[0] + t.px(22.0);
+            let ix = r.min[0] + t.px(20.0);
             let c = if active {
-                t.accent.mix(Color::WHITE, 0.3)
+                Color::WHITE
             } else {
                 t.text_muted.mix(t.text, hv)
             };
@@ -358,19 +373,19 @@ impl Shell {
         }
         let hv = kit.anim_bool(hash(wid, "collapse_h"), toggle.hovered);
         kit.dl()
-            .fill_rounded(tr, t.pxf(t.radius.md), t.surface_hover.alpha(hv * 0.7).pm());
+            .fill_rounded(tr, t.pxf(t.radius.md), Color::WHITE.alpha(hv * 0.07).pm());
         let icon = if collapsed {
             Icon::ChevronRight
         } else {
             Icon::ChevronLeft
         };
         let tcy = tr.min[1] + tr.height() / 2.0;
-        kit.icon(icon, [tr.min[0] + t.px(22.0), tcy], 14.0, t.text_muted);
+        kit.icon(icon, [tr.min[0] + t.px(20.0), tcy], 14.0, t.text_muted);
         if k < 0.6 {
-            let a = 1.0 - k / 0.6;
+            let a = (1.0 - k / 0.6).clamp(0.0, 1.0);
             kit.text_mid(
                 TextStyle::Caption,
-                tr.min[0] + t.px(40.0),
+                tr.min[0] + t.px(38.0),
                 tcy,
                 "Collapse",
                 t.text_faint.alpha(a),
@@ -437,15 +452,10 @@ impl Shell {
     pub fn end(&mut self, kit: &mut Kit, status: &str, ok: bool, right: &str) {
         let t = kit.theme.clone();
         let f = self.footer;
-        let r = t.pxf(t.radius.xl);
-        let bg = t.bg.mix(Color::BLACK, 0.25).pm();
-        kit.dl().fill_rounded(f, Corners::bottom(r), bg);
-        kit.dl()
-            .rect(Rect::new(f.min[0], f.min[1], f.width(), 1.0), t.border.pm());
         let cy = f.min[1] + f.height() / 2.0;
         let dot = if ok { t.success } else { t.danger };
         let dx = f.min[0] + t.sp(5);
-        kit.dl().circle([dx, cy], t.px(3.5), dot.alpha(0.25).pm());
+        kit.dl().circle([dx, cy], t.px(5.0), dot.alpha(0.18).pm());
         kit.dl().circle([dx, cy], t.px(2.5), dot.pm());
         let rw = kit.text_width(TextStyle::Caption, right);
         let max = f.max[0] - rw - t.px(48.0) - dx;
@@ -487,13 +497,21 @@ impl Shell {
         let c = if resp.hovered || self.resize.is_some() {
             t.text_muted
         } else {
-            t.text_faint
+            t.text_faint.alpha(0.7)
         };
-        for i in 1..=3 {
-            let d = g * i as f32 / 3.5;
-            let a = [grip.max[0] - d, grip.max[1]];
-            let b = [grip.max[0], grip.max[1] - d];
-            kit.dl().line(a, b, 1.0, c.pm());
+        // Two short arcs following the window's large corner radius.
+        let r = t.pxf(t.radius.xl);
+        let corner = [self.window.max[0] - r, self.window.max[1] - r];
+        for (i, inset) in [t.pxf(5.0), t.pxf(9.0)].into_iter().enumerate() {
+            let rr = r - inset;
+            let pts: Vec<[f32; 2]> = (0..=6)
+                .map(|k| {
+                    let a = (0.12 + 0.26 * k as f32 / 6.0) * std::f32::consts::PI;
+                    [corner[0] + rr * a.cos(), corner[1] + rr * a.sin()]
+                })
+                .collect();
+            let w = t.pxf(1.6 - 0.3 * i as f32);
+            kit.dl().polyline(&pts, false, w, c.pm());
         }
     }
 
@@ -518,16 +536,45 @@ mod tests {
 
     #[test]
     fn window_state_round_trips() {
+        let mut gradient = Gradient::preset(3);
+        gradient.angle = 45.0;
+        gradient.hue_speed = 30.0;
         let st = WindowState {
             pos: Some([120.0, 80.0]),
             size: [900.0, 640.0],
             sidebar_collapsed: true,
             page: 3,
-            accent: 2,
+            gradient,
+            blur: false,
         };
         assert_eq!(WindowState::from_text(&st.to_text()), st);
-        let bad = WindowState::from_text("w=10\nh=nan\npage=x\njunk");
+        let mut single = st.clone();
+        single.gradient = Gradient::single(Color::rgb(1, 2, 3));
+        assert_eq!(WindowState::from_text(&single.to_text()), single);
+        let bad = WindowState::from_text(
+            "w=10\nh=nan\npage=x\njunk\ngradient=nope\ngradient_angle=x\nhue_shift=9999",
+        );
         assert_eq!(bad.size, [WindowState::MIN[0], 700.0]);
         assert_eq!(bad.pos, None);
+        assert_eq!(bad.gradient.stops(), Gradient::default().stops());
+        assert_eq!(bad.gradient.angle, Gradient::DEFAULT_ANGLE);
+        assert_eq!(bad.gradient.hue_speed, Gradient::MAX_HUE_SPEED);
+        assert!(bad.blur);
+    }
+
+    /// Files written before gradients: the chosen accent survives as a single colour,
+    /// the old default becomes the default gradient.
+    #[test]
+    fn old_window_files_still_load() {
+        let old = "x=100\ny=50\nw=1100\nh=720\nsidebar_collapsed=false\npage=2\naccent=4\n";
+        let st = WindowState::from_text(old);
+        assert_eq!(
+            (st.pos, st.size, st.page),
+            (Some([100.0, 50.0]), [1100.0, 720.0], 2)
+        );
+        assert_eq!(st.gradient.stops(), &[ACCENTS[4].1]);
+        assert!(st.blur);
+        let default = WindowState::from_text("w=1020\nh=700\npage=0\naccent=0\n");
+        assert_eq!(default.gradient, Gradient::default());
     }
 }

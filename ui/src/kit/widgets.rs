@@ -6,7 +6,7 @@
 use super::{Id, Key, Kit, Resp, hash};
 use crate::draw::Rect;
 use crate::primitives::{Corners, Icon, Shapes};
-use crate::theme::{Color, TextStyle};
+use crate::theme::{Color, GlassKind, TextStyle};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ButtonKind {
@@ -143,43 +143,65 @@ impl Kit {
         let resp = self.interact(id, r, true);
         let t = self.theme.clone();
         let hover = self.anim_bool(hash(id, "h"), resp.hovered);
-        let press = self.anim_bool(hash(id, "p"), resp.held);
-        let (bg, fg, border) = match kind {
-            ButtonKind::Primary => (
-                t.accent
-                    .mix(Color::WHITE, 0.10 * hover)
-                    .mix(Color::BLACK, 0.12 * press),
-                t.on_accent,
-                Color::TRANSPARENT,
-            ),
-            ButtonKind::Danger => (
-                t.danger
-                    .mix(Color::WHITE, 0.10 * hover)
-                    .mix(Color::BLACK, 0.12 * press),
-                Color::WHITE,
-                Color::TRANSPARENT,
-            ),
-            ButtonKind::Secondary => (
-                t.surface_raised.mix(t.surface_hover, hover),
-                t.text,
-                t.border_strong,
-            ),
-            ButtonKind::Ghost => (
-                t.surface_hover.alpha(hover),
-                t.text_muted.mix(t.text, hover),
-                Color::TRANSPARENT,
-            ),
+        // Springy press: the capsule sinks in and pops back.
+        let press = self.spring_bool(hash(id, "p"), resp.held);
+        let s = (t.pxf(1.5) * press).clamp(-t.pxf(0.6), t.pxf(2.0));
+        let r = Rect {
+            min: [r.min[0] + s, r.min[1] + s * 0.6],
+            max: [r.max[0] - s, r.max[1] - s * 0.6],
         };
-        let radius = t.pxf(t.radius.md);
-        self.dl().fill_rounded(r, radius, bg.pm());
-        if border.0[3] > 0 {
-            self.dl().stroke_rounded(r, radius, 1.0, border.pm());
+        let radius = r.height() / 2.0;
+        let fg = match kind {
+            ButtonKind::Primary => {
+                self.grad_glow(r, radius, t.pxf(5.0 + 5.0 * hover), 0.18 + 0.17 * hover);
+                self.grad_fill(r, radius, 1.0, r);
+                // Darken a little for white text on bright stops (yellow, mint).
+                let shade = Color::BLACK.alpha(0.20 - 0.08 * hover + 0.10 * press.max(0.0));
+                self.dl().fill_rounded(r, radius, shade.pm());
+                t.on_accent
+            }
+            ButtonKind::Danger => {
+                let bg = t
+                    .danger
+                    .mix(Color::WHITE, 0.10 * hover)
+                    .mix(Color::BLACK, 0.15 * press.max(0.0));
+                self.dl().fill_rounded(r, radius, bg.pm());
+                Color::WHITE
+            }
+            ButtonKind::Secondary => {
+                let bg = Color::WHITE.alpha(0.08 + 0.06 * hover);
+                self.dl().fill_rounded(r, radius, bg.pm());
+                t.text
+            }
+            ButtonKind::Ghost => {
+                let bg = Color::WHITE.alpha(0.07 * hover);
+                self.dl().fill_rounded(r, radius, bg.pm());
+                t.text_muted.mix(t.text, hover)
+            }
+        };
+        if kind != ButtonKind::Ghost {
+            let sheen = Color::WHITE.alpha(0.16).pm();
+            self.dl().gradient_rounded(r, radius, sheen, 0);
+            self.lit_rim(r, radius, 0.8);
         }
         let tw = self.text_width(TextStyle::Body, label);
         let c = center(&r);
-        self.text_mid(TextStyle::Body, (c[0] - tw / 2.0).round(), c[1], label, fg);
+        let x = (c[0] - tw / 2.0).round();
+        if matches!(kind, ButtonKind::Primary | ButtonKind::Danger) {
+            self.text_shadowed(TextStyle::Body, x, c[1], label, fg);
+        } else {
+            self.text_mid(TextStyle::Body, x, c[1], label, fg);
+        }
         self.focus_ring(id, r, radius);
         resp.activated
+    }
+
+    /// Text with a soft dark drop (white text on bright gradient stops).
+    pub fn text_shadowed(&mut self, style: TextStyle, x: f32, cy: f32, s: &str, color: Color) {
+        let o = self.theme.pxf(1.0).max(1.0);
+        let shadow = Color::BLACK.alpha(0.38 * color.0[3] as f32 / 255.0);
+        self.text_mid(style, x, cy + o, s, shadow);
+        self.text_mid(style, x, cy, s, color);
     }
 
     // ------------------------------------------------------------------ rows
@@ -202,7 +224,7 @@ impl Kit {
     /// Animated switch in `rect` (track size from the theme, right aligned).
     pub fn switch_at(&mut self, id: Id, area: Rect, value: &mut bool) -> bool {
         let t = self.theme.clone();
-        let (w, h) = (t.px(34.0), t.px(20.0));
+        let (w, h) = (t.px(38.0), t.px(22.0));
         let c = center(&area);
         let track = Rect::new(area.max[0] - w, (c[1] - h / 2.0).round(), w, h);
         let resp = self.interact(id, area, true);
@@ -211,16 +233,30 @@ impl Kit {
             *value = !*value;
         }
         let on = self.anim_bool(hash(id, "on"), *value);
+        // Knob travel and press stretch are springs: a little overshoot, never slow.
+        let pos = self.spring_bool(hash(id, "pos"), *value).clamp(-0.08, 1.08);
+        let stretch = self.spring_bool(hash(id, "s"), resp.held).max(0.0);
         let hover = self.anim_bool(hash(id, "h"), resp.hovered);
-        let off_bg = t.surface_hover.mix(t.border_strong, hover);
-        let bg = off_bg.mix(t.accent, on);
-        self.dl().fill_rounded(track, h / 2.0, bg.pm());
-        let knob_r = h / 2.0 - t.px(3.0) + resp.held as u8 as f32;
-        let kx = track.min[0] + h / 2.0 + (w - h) * on;
-        let shadow = Color::rgba(0, 0, 0, 60).pm();
-        self.dl().circle([kx, c[1] + 1.0], knob_r + 0.5, shadow);
-        let knob = Color::WHITE.mix(t.text_muted, (1.0 - on) * 0.25).pm();
-        self.dl().circle([kx, c[1]], knob_r, knob);
+        let off_bg = Color::WHITE.alpha(0.13 + 0.06 * hover);
+        self.dl().fill_rounded(track, h / 2.0, off_bg.pm());
+        if on > 0.0 {
+            self.grad_glow(track, h / 2.0, t.pxf(5.0), 0.3 * on * hover);
+            self.grad_fill(track, h / 2.0, on, track);
+        }
+        let knob_r = h / 2.0 - t.px(2.5);
+        let extra = t.px(6.0) * stretch;
+        let kx = track.min[0] + h / 2.0 + (w - h) * pos;
+        // Stretch toward the travel direction while held.
+        let (x0, x1) = if *value {
+            (kx - knob_r - extra, kx + knob_r)
+        } else {
+            (kx - knob_r, kx + knob_r + extra)
+        };
+        let knob = Rect::new(x0, c[1] - knob_r, x1 - x0, knob_r * 2.0);
+        let shadow = Color::BLACK.alpha(0.30).pm();
+        self.dl()
+            .shadow(knob, knob_r, t.pxf(3.0), [0.0, t.pxf(1.0)], shadow);
+        self.dl().fill_rounded(knob, knob_r, Color::WHITE.pm());
         self.focus_ring(id, track, h / 2.0);
         changed
     }
@@ -250,15 +286,18 @@ impl Kit {
             *value = !*value;
         }
         let on = self.anim_bool(hash(id, "on"), *value);
+        let pop = self.spring_bool(hash(id, "pop"), *value).max(0.0);
         let hover = self.anim_bool(hash(id, "h"), resp.hovered);
         let r = t.pxf(t.radius.sm);
-        let bg = t.surface_hover.mix(t.accent, on);
+        let bg = Color::WHITE.alpha(0.10 + 0.05 * hover);
         self.dl().fill_rounded(bx, r, bg.pm());
-        let border = t.border_strong.mix(t.text_muted, hover).alpha(1.0 - on);
+        self.grad_fill(bx, r, on, bx);
+        let border = Color::WHITE.alpha((0.22 + 0.15 * hover) * (1.0 - on));
         self.dl().stroke_rounded(bx, r, 1.0, border.pm());
+        self.lit_rim(bx, r, 0.6 * on);
         if on > 0.01 {
             let c = center(&bx);
-            let size = s * (0.6 + 0.4 * on);
+            let size = s * (0.55 + 0.45 * pop);
             let w = t.pxf(2.0);
             let col = t.on_accent.alpha(on).pm();
             self.dl().icon(Icon::Check, c, size, w, col);
@@ -299,10 +338,10 @@ impl Kit {
             t.text,
         );
         let track_y = row.min[1] + t.px(34.0);
-        let knob_r = t.px(7.0);
+        let knob_r = t.px(8.0);
         let track = Rect {
-            min: [row.min[0] + knob_r, track_y - t.px(2.0)],
-            max: [row.max[0] - knob_r, track_y + t.px(2.0)],
+            min: [row.min[0] + knob_r, track_y - t.px(3.0)],
+            max: [row.max[0] - knob_r, track_y + t.px(3.0)],
         };
         let hit = Rect {
             min: [row.min[0], track_y - t.px(11.0)],
@@ -352,8 +391,15 @@ impl Kit {
             *value = snap(*value, lo, step).clamp(lo, hi);
         }
         let frac = ((*value - lo) / span).clamp(0.0, 1.0);
-        let shown = self.anim(hash(id, "v"), frac);
+        // Dragging follows the mouse 1:1; jumps and keys glide with a spring.
+        let shown = if resp.held && !resp.pressed {
+            self.springs.insert(hash(id, "v"), [frac, 0.0]);
+            frac
+        } else {
+            self.spring(hash(id, "v"), frac).clamp(-0.01, 1.01)
+        };
         let hover = self.anim_bool(hash(id, "h"), resp.hovered || resp.held);
+        let grab = self.spring_bool(hash(id, "g"), resp.held);
         // Value pill.
         let pill = Rect::new(
             row.max[0] - pill_w,
@@ -361,12 +407,12 @@ impl Kit {
             pill_w,
             t.px(20.0),
         );
-        let pill_bg = t.surface_hover.mix(t.accent_soft(), hover);
+        let pill_bg = Color::WHITE.alpha(0.08 + 0.05 * hover);
         self.dl()
             .fill_rounded(pill, pill.height() / 2.0, pill_bg.pm());
         let pc = center(&pill);
         let tw = self.text_width(TextStyle::Caption, &text);
-        let vc = t.text.mix(t.accent.mix(Color::WHITE, 0.4), hover);
+        let vc = t.text.mix(t.accent_text(), hover);
         self.text_mid(
             TextStyle::Caption,
             (pc[0] - tw / 2.0).round(),
@@ -374,22 +420,25 @@ impl Kit {
             &text,
             vc,
         );
-        // Track.
+        // Track: the gradient is laid over the whole track, the fill reveals it.
         let rr = track.height() / 2.0;
-        let bg = t.surface_hover.pm();
+        let bg = Color::WHITE.alpha(0.13).pm();
         self.dl().fill_rounded(track, rr, bg);
         let kx = track.min[0] + w * shown;
         let fill = Rect {
             min: track.min,
             max: [kx.max(track.min[0] + rr * 2.0), track.max[1]],
         };
-        let ac = t.accent.pm();
-        self.dl().fill_rounded(fill, rr, ac);
-        let halo = t.accent.alpha(0.18 * hover).pm();
+        self.grad_glow(fill, rr, t.pxf(4.0), 0.25 * hover);
+        self.grad_fill(fill, rr, 1.0, track);
+        // Glass knob: grows when grabbed, gradient halo while hovered.
+        let kr = knob_r + t.pxf(2.0) * grab.max(-0.3);
+        let knob = Rect::new(kx - kr, track_y - kr, kr * 2.0, kr * 2.0);
+        self.grad_glow(knob, kr, t.pxf(6.0) * hover, 0.35 * hover);
+        let shadow = Color::BLACK.alpha(0.32).pm();
         self.dl()
-            .circle([kx, track_y], knob_r + t.px(4.0) * hover, halo);
-        self.dl().circle([kx, track_y], knob_r, Color::WHITE.pm());
-        self.dl().circle([kx, track_y], knob_r - t.px(3.0), ac);
+            .shadow(knob, kr, t.pxf(3.0), [0.0, t.pxf(1.0)], shadow);
+        self.dl().circle([kx, track_y], kr, Color::WHITE.pm());
         self.focus_ring(
             id,
             Rect::new(kx - knob_r, track_y - knob_r, knob_r * 2.0, knob_r * 2.0),
@@ -470,9 +519,12 @@ impl Kit {
                 *index = (*index + 1).min(n - 1);
             }
         }
-        let r = t.pxf(t.radius.md);
-        self.dl().fill_rounded(seg, r, t.surface_hover.pm());
-        let x = self.anim(hash(id, "x"), *index as f32);
+        let r = h / 2.0;
+        self.dl()
+            .fill_rounded(seg, r, Color::WHITE.alpha(0.08).pm());
+        let x = self
+            .spring(hash(id, "x"), *index as f32)
+            .clamp(-0.1, (n - 1) as f32 + 0.1);
         let inset = t.px(2.0);
         let sel = Rect::new(
             (seg.min[0] + cell * x + inset).round(),
@@ -480,8 +532,14 @@ impl Kit {
             (cell - 2.0 * inset).round(),
             h - 2.0 * inset,
         );
-        let sel_bg = t.accent.pm();
-        self.dl().fill_rounded(sel, r - inset, sel_bg);
+        // Selection: a gradient capsule (colour by position across the control), shaded
+        // a little so white text stays readable on bright stops.
+        self.grad_fill(sel, r - inset, 0.9, seg);
+        let shade = Color::BLACK.alpha(0.22).pm();
+        self.dl().fill_rounded(sel, r - inset, shade);
+        let sheen = Color::WHITE.alpha(0.14).pm();
+        self.dl().gradient_rounded(sel, r - inset, sheen, 0);
+        self.lit_rim(sel, r - inset, 0.7);
         for (i, o) in options.iter().enumerate() {
             let cx = seg.min[0] + cell * (i as f32 + 0.5);
             let max = cell - t.px(6.0);
@@ -493,13 +551,12 @@ impl Kit {
                 .text_muted
                 .mix(t.text, hovered as u8 as f32)
                 .mix(t.on_accent, near);
-            self.text_mid(
-                TextStyle::Caption,
-                (cx - tw / 2.0).round(),
-                seg.min[1] + h / 2.0,
-                &text,
-                c,
-            );
+            let (tx, ty) = ((cx - tw / 2.0).round(), seg.min[1] + h / 2.0);
+            if near > 0.5 {
+                self.text_shadowed(TextStyle::Caption, tx, ty, &text, c);
+            } else {
+                self.text_mid(TextStyle::Caption, tx, ty, &text, c);
+            }
         }
         self.focus_ring(id, seg, r);
         self.last_rect = seg;
@@ -539,15 +596,21 @@ impl Kit {
             } else {
                 self.open_popup(id, field);
                 self.popup_highlight = *index;
+                self.springs.insert(hash(id, "drop"), [0.0, 0.0]);
             }
         }
         let open = self.is_open(id);
         let hover = self.anim_bool(hash(id, "h"), resp.hovered || open);
+        let lit = self.anim_bool(hash(id, "lit"), open);
         let r = t.pxf(t.radius.md);
-        let bg = t.surface_raised.mix(t.surface_hover, hover);
+        let bg = Color::WHITE.alpha(0.07 + 0.05 * hover);
         self.dl().fill_rounded(field, r, bg.pm());
-        let border = if open { t.accent } else { t.border_strong };
+        let border = Color::WHITE.alpha(0.14 * (1.0 - lit));
         self.dl().stroke_rounded(field, r, 1.0, border.pm());
+        if lit > 0.0 {
+            self.grad_glow(field, r, t.pxf(5.0), 0.25 * lit);
+            self.grad_stroke(field, r, t.pxf(1.2), lit, field);
+        }
         let cy = field.min[1] + field.height() / 2.0;
         let current = options.get(*index).copied().unwrap_or("–");
         let max = field.width() - t.sp(3) * 2.0 - t.px(16.0);
@@ -609,6 +672,14 @@ impl Kit {
             below
         };
         let rect = Rect::new(field.min[0], y.max(0.0), w, h);
+        // Opening: a springy drop from the field.
+        let drop = self.spring(hash(id, "drop"), 1.0);
+        let fade = (0.4 + 0.6 * drop).clamp(0.0, 1.0);
+        let lift = (1.0 - drop) * t.px(10.0) * if y < field.min[1] { 1.0 } else { -1.0 };
+        let rect = Rect {
+            min: [rect.min[0], rect.min[1] + lift],
+            max: [rect.max[0], rect.max[1] + lift],
+        };
         // Keyboard: arrows move the highlight over the filtered list, Enter picks.
         let mut hl = shown
             .iter()
@@ -642,12 +713,9 @@ impl Kit {
                 k.input.wheel = 0.0;
             }
             k.popup_scroll = k.popup_scroll.clamp(0.0, max_scroll);
+            let r = t.pxf(t.radius.md) + pad;
+            k.glass(rect, r, GlassKind::Popup, fade);
             let r = t.pxf(t.radius.md);
-            let sh = t.shadow_popup;
-            let (blur, off) = (t.pxf(sh.blur), [0.0, t.pxf(sh.offset[1])]);
-            k.dl().shadow(rect, r, blur, off, sh.color.pm());
-            k.dl().fill_rounded(rect, r, t.surface_raised.pm());
-            k.dl().stroke_rounded(rect, r, 1.0, t.border_strong.pm());
             if searchable {
                 let s = Rect::new(
                     rect.min[0] + pad,
@@ -655,7 +723,7 @@ impl Kit {
                     w - 2.0 * pad,
                     search_h - pad,
                 );
-                k.dl().fill_rounded(s, r - 2.0, t.surface.pm());
+                k.dl().fill_rounded(s, r, Color::WHITE.alpha(0.08).pm());
                 let cy = s.min[1] + s.height() / 2.0;
                 k.icon(
                     Icon::Search,
@@ -672,7 +740,7 @@ impl Kit {
                     let blink = (k.time * 2.0).fract() < 0.6;
                     if blink {
                         let caret = Rect::new(x + adv + 1.0, cy - t.px(7.0), 1.0, t.px(14.0));
-                        k.dl().rect(caret, t.accent.pm());
+                        k.dl().rect(caret, t.accent_text().pm());
                     }
                 }
             }
@@ -703,11 +771,12 @@ impl Kit {
                 }
                 let selected = i == *index;
                 if row == hl {
-                    k.dl().fill_rounded(ir, r - 2.0, t.surface_hover.pm());
+                    k.dl().fill_rounded(ir, r, Color::WHITE.alpha(0.10).pm());
                 }
                 let cy = iy + item_h / 2.0;
                 if selected {
-                    k.icon(Icon::Check, [ir.max[0] - t.px(14.0), cy], 14.0, t.accent);
+                    let at = [ir.max[0] - t.px(14.0), cy];
+                    k.icon(Icon::Check, at, 14.0, t.accent_text());
                 }
                 let color = if selected {
                     t.text
@@ -752,6 +821,60 @@ impl Kit {
             h,
         );
         self.debug(label, swatch);
+        let hex = color.to_hex();
+        let cy = swatch.min[1] + h / 2.0;
+        let tw = self.text_width(TextStyle::Caption, &hex);
+        self.text_mid(
+            TextStyle::Caption,
+            swatch.min[0] - t.sp(2) - tw,
+            cy,
+            &hex,
+            t.text_muted,
+        );
+        let (changed, resp) = self.color_swatch_at(id, swatch, color, presets);
+        self.last_rect = row;
+        self.last_id = id;
+        self.last_hovered = resp.hovered;
+        changed
+    }
+
+    /// Row of colour swatches (gradient stops): label left, one swatch per colour right,
+    /// each opening the colour picker. Returns whether a colour changed.
+    pub fn color_row(&mut self, label: &str, colors: &mut [Color], presets: &[Color]) -> bool {
+        let id = self.id(label);
+        let t = self.theme.clone();
+        let rh = t.px(t.row);
+        let (sw, gap) = (t.px(28.0), t.px(6.0));
+        let n = colors.len().max(1) as f32;
+        let w = sw * n + gap * (n - 1.0);
+        let (row, _) = self.row_label(label, rh, w);
+        let h = t.px(22.0);
+        let y = (row.min[1] + (rh - h) / 2.0).round();
+        let mut changed = false;
+        let mut hovered = false;
+        for (i, c) in colors.iter_mut().enumerate() {
+            let x = row.max[0] - w + (sw + gap) * i as f32;
+            let swatch = Rect::new(x.round(), y, sw, h);
+            self.debug(&format!("{label} {}", i + 1), swatch);
+            let (ch, resp) = self.color_swatch_at(hash(id, &format!("{i}")), swatch, c, presets);
+            changed |= ch;
+            hovered |= resp.hovered;
+        }
+        self.last_rect = row;
+        self.last_id = id;
+        self.last_hovered = hovered;
+        changed
+    }
+
+    /// A swatch that opens the colour picker below it; (changed, response).
+    pub fn color_swatch_at(
+        &mut self,
+        id: Id,
+        swatch: Rect,
+        color: &mut Color,
+        presets: &[Color],
+    ) -> (bool, Resp) {
+        let t = self.theme.clone();
         let resp = self.interact(id, swatch, true);
         if resp.activated {
             if self.is_open(id) {
@@ -763,27 +886,24 @@ impl Kit {
         }
         let hover = self.anim_bool(hash(id, "h"), resp.hovered);
         let r = t.pxf(t.radius.sm);
-        let hex = color.to_hex();
-        let cy = swatch.min[1] + h / 2.0;
-        let tw = self.text_width(TextStyle::Caption, &hex);
-        self.text_mid(
-            TextStyle::Caption,
-            swatch.min[0] - t.sp(2) - tw,
-            cy,
-            &hex,
-            t.text_muted,
-        );
+        let open = self.is_open(id);
+        let lift = self.spring_bool(hash(id, "lift"), resp.hovered || open);
+        let g = t.pxf(1.5) * lift.max(0.0);
+        let swatch = Rect {
+            min: [swatch.min[0] - g, swatch.min[1] - g],
+            max: [swatch.max[0] + g, swatch.max[1] + g],
+        };
+        let sh = Color::BLACK.alpha(0.3).pm();
+        self.dl()
+            .shadow(swatch, r, t.pxf(2.0 + 3.0 * lift), [0.0, t.pxf(1.0)], sh);
         self.dl().fill_rounded(swatch, r, color.pm());
-        let ring = t.border_strong.mix(t.text, hover * 0.6);
+        let sheen = Color::WHITE.alpha(0.18).pm();
+        self.dl().gradient_rounded(swatch, r, sheen, 0);
+        let ring = Color::WHITE.alpha(0.18 + 0.3 * hover);
         self.dl().stroke_rounded(swatch, r, 1.0, ring.pm());
         self.focus_ring(id, swatch, r);
-        self.last_rect = row;
-        self.last_id = id;
-        self.last_hovered = resp.hovered;
-        if self.is_open(id) {
-            return self.color_popup(id, swatch, color, presets);
-        }
-        false
+        let changed = self.is_open(id) && self.color_popup(id, swatch, color, presets);
+        (changed, resp)
     }
 
     fn color_popup(&mut self, id: Id, anchor: Rect, color: &mut Color, presets: &[Color]) -> bool {
@@ -814,16 +934,7 @@ impl Kit {
         }
         self.popup_layer(rect, |k| {
             let r = t.pxf(t.radius.lg);
-            let sh = t.shadow_popup;
-            k.dl().shadow(
-                rect,
-                r,
-                t.pxf(sh.blur),
-                [0.0, t.pxf(sh.offset[1])],
-                sh.color.pm(),
-            );
-            k.dl().fill_rounded(rect, r, t.surface_raised.pm());
-            k.dl().stroke_rounded(rect, r, 1.0, t.border_strong.pm());
+            k.glass(rect, r, GlassKind::Popup, 1.0);
             let sq_r = Rect::new(rect.min[0] + pad, rect.min[1] + pad, sq, sq);
             let bar_r = Rect::new(sq_r.max[0] + pad, sq_r.min[1], bar, sq);
             // SV square: white → hue horizontally, then transparent → black vertically.
@@ -833,7 +944,8 @@ impl Kit {
             let clear = Color::rgba(0, 0, 0, 0).pm();
             let black = Color::BLACK.pm();
             k.dl().gradient_rect(sq_r, [clear, clear, black, black]);
-            k.dl().stroke_rounded(sq_r, 0.0, 1.0, t.border.pm());
+            k.dl()
+                .stroke_rounded(sq_r, 0.0, 1.0, Color::WHITE.alpha(0.16).pm());
             // Hue bar: six gradient segments.
             for i in 0..6 {
                 let seg_h = sq / 6.0;
@@ -985,17 +1097,16 @@ impl Kit {
         };
         let hover = self.anim_bool(hash(id, "h"), resp.hovered);
         let r = h / 2.0;
-        let bg = t
-            .surface_hover
-            .mix(t.surface_raised, 1.0 - hover)
-            .mix(t.accent_soft(), capturing as u8 as f32);
+        let bg = Color::WHITE.alpha(0.08 + 0.05 * hover);
         self.dl().fill_rounded(pill, r, bg.pm());
-        let border = if capturing {
-            t.accent.alpha(0.5 + 0.5 * pulse)
+        if capturing {
+            self.grad_glow(pill, r, t.pxf(4.0 + 4.0 * pulse), 0.3);
+            self.grad_fill(pill, r, 0.22, pill);
+            self.grad_stroke(pill, r, t.pxf(1.2), 0.55 + 0.45 * pulse, pill);
         } else {
-            t.border_strong
-        };
-        self.dl().stroke_rounded(pill, r, 1.0, border.pm());
+            self.dl()
+                .stroke_rounded(pill, r, 1.0, Color::WHITE.alpha(0.14).pm());
+        }
         let tw = self.text_width(TextStyle::Caption, &text);
         let c = center(&pill);
         let fg = if capturing {
@@ -1028,6 +1139,19 @@ impl Kit {
         text: &mut String,
         max: usize,
         placeholder: &str,
+    ) -> bool {
+        self.text_edit_core(id, rect, text, max, placeholder, true)
+    }
+
+    /// Text editing; `framed` draws the field background and (gradient) focus border.
+    fn text_edit_core(
+        &mut self,
+        id: Id,
+        rect: Rect,
+        text: &mut String,
+        max: usize,
+        placeholder: &str,
+        framed: bool,
     ) -> bool {
         let t = self.theme.clone();
         let resp = self.interact(id, rect, true);
@@ -1088,10 +1212,16 @@ impl Kit {
         let hover = self.anim_bool(hash(id, "h"), resp.hovered);
         let f = self.anim_bool(hash(id, "f"), focused);
         let r = t.pxf(t.radius.md);
-        let bg = t.surface.mix(t.surface_hover, hover * 0.5);
-        self.dl().fill_rounded(rect, r, bg.pm());
-        let border = t.border_strong.mix(t.accent, f);
-        self.dl().stroke_rounded(rect, r, 1.0, border.pm());
+        if framed {
+            let bg = Color::WHITE.alpha(0.06 + 0.03 * hover + 0.03 * f);
+            self.dl().fill_rounded(rect, r, bg.pm());
+            let border = Color::WHITE.alpha(0.14 * (1.0 - f));
+            self.dl().stroke_rounded(rect, r, 1.0, border.pm());
+            if f > 0.0 {
+                self.grad_glow(rect, r, t.pxf(5.0), 0.28 * f);
+                self.grad_stroke(rect, r, t.pxf(1.2), f, rect);
+            }
+        }
         let cy = rect.min[1] + rect.height() / 2.0;
         let x = rect.min[0] + t.sp(2);
         self.dl().push_clip(rect.shrink(1.0));
@@ -1101,15 +1231,15 @@ impl Kit {
             if self.select_all && focused {
                 let w = self.text_width(TextStyle::Body, text);
                 let sel = Rect::new(x, cy - t.px(8.0), w, t.px(16.0));
-                self.dl().rect(sel, t.accent.alpha(0.35).pm());
+                self.grad_fill(sel, t.pxf(3.0), 0.4, sel);
             }
             self.text_mid(TextStyle::Body, x, cy, text, t.text);
             if focused && (self.time * 2.0).fract() < 0.6 {
                 let pre: String = text.chars().take(self.caret).collect();
                 let cx = x + self.text_width(TextStyle::Body, &pre);
                 self.dl().rect(
-                    Rect::new(cx.round(), cy - t.px(7.0), 1.0, t.px(14.0)),
-                    t.accent.pm(),
+                    Rect::new(cx.round(), cy - t.px(7.0), t.pxf(1.5).max(1.0), t.px(14.0)),
+                    t.accent_text().pm(),
                 );
             }
         }
@@ -1134,32 +1264,23 @@ impl Kit {
         };
         let focused = self.focus == id;
         let f = self.anim_bool(hash(id, "f"), focused);
-        let bg = t.surface.mix(t.surface_raised, f);
+        let inside = rect.contains(self.input.mouse);
+        let hover = self.anim_bool(hash(id, "sh"), inside);
+        let bg = Color::WHITE.alpha(0.07 + 0.03 * hover + 0.04 * f);
         self.dl().fill_rounded(rect, r, bg.pm());
-        let border = t.border.mix(t.accent, f);
+        let border = Color::WHITE.alpha(0.12 * (1.0 - f));
         self.dl().stroke_rounded(rect, r, 1.0, border.pm());
-        let cy = rect.min[1] + rect.height() / 2.0;
-        let ic = t.text_faint.mix(t.accent, f);
-        self.icon(Icon::Search, [rect.min[0] + t.px(15.0), cy], 15.0, ic);
-        // The inner editor draws without its own frame: transparent theme copy.
-        let saved = self.theme.clone();
-        self.theme.surface = Color::TRANSPARENT;
-        self.theme.surface_hover = Color::TRANSPARENT;
-        self.theme.border_strong = Color::TRANSPARENT;
-        self.theme.accent = Color::TRANSPARENT;
-        self.theme.text = saved.text;
-        let ph = if focused { "" } else { placeholder };
-        let changed = self.text_edit_at(id, edit, query, 48, ph);
-        self.theme = saved;
-        // Caret colour lost in the transparent theme: redraw a caret when focused.
-        if focused && (self.time * 2.0).fract() < 0.6 {
-            let pre: String = query.chars().take(self.caret).collect();
-            let cx = edit.min[0] + t.sp(2) + self.text_width(TextStyle::Body, &pre);
-            self.dl().rect(
-                Rect::new(cx.round(), cy - t.px(7.0), 1.0, t.px(14.0)),
-                t.accent.pm(),
-            );
+        if f > 0.0 {
+            self.grad_glow(rect, r, t.pxf(6.0), 0.3 * f);
+            self.grad_stroke(rect, r, t.pxf(1.2), f, rect);
         }
+        self.lit_rim(rect, r, 0.5);
+        let cy = rect.min[1] + rect.height() / 2.0;
+        let ic = t.text_faint.mix(t.accent_text(), f);
+        self.icon(Icon::Search, [rect.min[0] + t.px(15.0), cy], 15.0, ic);
+        // The inner editor draws without its own frame.
+        let ph = if focused { "" } else { placeholder };
+        let changed = self.text_edit_core(id, edit, query, 48, ph, false);
         let mut changed = changed;
         if !query.is_empty() {
             let cr = Rect::new(rect.max[0] - icon_w, rect.min[1], icon_w, rect.height());
@@ -1228,7 +1349,7 @@ impl Kit {
             }
         }
         let base = Rect::new(row.min[0], row.max[1] - 1.0, row.width(), 1.0);
-        self.dl().rect(base, t.border.pm());
+        self.dl().rect(base, Color::WHITE.alpha(0.08).pm());
         let m = self.input.mouse;
         for (i, (n, (sx, sw))) in names.iter().zip(&spans).enumerate() {
             let sel = self.anim_bool(hash(id, &format!("t{i}")), i == *index);
@@ -1239,10 +1360,11 @@ impl Kit {
             self.text_mid(TextStyle::Body, *sx, row.min[1] + h / 2.0 - 1.0, n, c);
         }
         if let Some(&(sx, sw)) = spans.get(*index) {
-            let x = self.anim(hash(id, "x"), sx);
-            let w = self.anim(hash(id, "w"), sw);
-            let bar = Rect::new(x, row.max[1] - t.px(2.0), w, t.px(2.0));
-            self.dl().fill_rounded(bar, t.px(1.0), t.accent.pm());
+            let x = self.spring(hash(id, "x"), sx);
+            let w = self.spring(hash(id, "w"), sw).max(t.px(8.0));
+            let bar = Rect::new(x, row.max[1] - t.px(3.0), w, t.px(3.0));
+            self.grad_glow(bar, t.px(1.5), t.pxf(5.0), 0.3);
+            self.grad_fill(bar, t.px(1.5), 1.0, row);
         }
         self.focus_ring(id, row, t.pxf(t.radius.sm));
         *index != before
@@ -1262,9 +1384,12 @@ impl Kit {
         if let Some(icon) = head.icon {
             let s = t.px(26.0);
             let ib = Rect::new(x, (cy - s / 2.0).round(), s, s);
-            self.dl()
-                .fill_rounded(ib, t.pxf(t.radius.md), t.accent_soft().pm());
-            self.icon(icon, center(&ib), 15.0, t.accent.mix(Color::WHITE, 0.25));
+            let ir = t.pxf(8.0);
+            self.grad_fill(ib, ir, 0.85, ib);
+            let shade = Color::BLACK.alpha(0.18).pm();
+            self.dl().fill_rounded(ib, ir, shade);
+            self.lit_rim(ib, ir, 0.9);
+            self.icon(icon, center(&ib), 15.0, Color::WHITE);
             x += s + t.sp(3);
         }
         let right = if switch.is_some() { t.px(44.0) } else { 0.0 };
@@ -1289,7 +1414,7 @@ impl Kit {
         let _ = outer;
         let line_y = r.max[1] - t.px(2.0);
         let line = Rect::new(r.min[0], line_y, r.width(), 1.0);
-        self.dl().rect(line, t.border.pm());
+        self.dl().rect(line, Color::WHITE.alpha(0.07).pm());
         self.space(t.sp(1));
         changed
     }
@@ -1401,30 +1526,22 @@ impl Kit {
         } else if self.take_key(Key::Enter) {
             result = Some(true);
         }
-        let shown = self.anim_bool(hash(id, "in"), true);
+        let shown = self.spring(hash(id, "in"), 1.0);
         self.popup_layer(area, |k| {
-            k.dl().fill_rounded(area, t.pxf(t.radius.xl), t.scrim.pm());
-            let lift = (1.0 - shown) * t.px(12.0);
+            let scrim = t.scrim.alpha(shown.clamp(0.0, 1.0));
+            k.dl().fill_rounded(area, t.pxf(t.radius.xl), scrim.pm());
+            let lift = (1.0 - shown) * t.px(16.0);
             let rect = Rect {
                 min: [rect.min[0], rect.min[1] + lift],
                 max: [rect.max[0], rect.max[1] + lift],
             };
             let r = t.pxf(t.radius.xl);
-            let sh = t.shadow_window;
-            k.dl().shadow(
-                rect,
-                r,
-                t.pxf(sh.blur),
-                [0.0, t.pxf(sh.offset[1])],
-                sh.color.pm(),
-            );
-            k.dl().fill_rounded(rect, r, t.surface_raised.pm());
-            k.dl().stroke_rounded(rect, r, 1.0, t.border_strong.pm());
+            k.glass(rect, r, GlassKind::Popup, (0.3 + shown).clamp(0.0, 1.0));
             let pad = t.sp(5);
             let (icon, ic) = if danger {
                 (Icon::Warning, t.danger)
             } else {
-                (Icon::Info, t.accent)
+                (Icon::Info, t.accent_text())
             };
             let ty = rect.min[1] + pad + t.px(12.0);
             k.icon(icon, [rect.min[0] + pad + t.px(9.0), ty], 18.0, ic);
@@ -1465,7 +1582,7 @@ impl Kit {
         });
         if result.is_some() {
             self.close_popup();
-            self.anims.remove(&hash(id, "in"));
+            self.springs.remove(&hash(id, "in"));
         }
         result
     }
@@ -1473,7 +1590,7 @@ impl Kit {
     pub fn open_confirm(&mut self, label: &str) {
         let id = self.id(label);
         self.open_popup(id, Rect::default());
-        self.anims.insert(hash(id, "in"), 0.0);
+        self.springs.insert(hash(id, "in"), [0.0, 0.0]);
     }
 
     /// Response of the last widget (tests, tooling).

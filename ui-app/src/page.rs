@@ -1,13 +1,17 @@
 //! What the window shows: the poly shell with a "Test inputs" page (one of each input,
-//! their live values next to them) and the full widget gallery.
+//! their live values next to them, the appearance editor) and the full widget gallery.
+//!
+//! The glass blurs whatever is in the back buffer under it. In the game that is the game
+//! picture; here it is [`wallpaper`], a slowly drifting set of colour blobs painted inside
+//! the shell before the kit draws.
 
 use poly_ui::draw::{DrawList, Rect, TextureDelta};
 use poly_ui::kit::gallery::{self, GalleryState, WEAPONS};
 use poly_ui::kit::shell::{NavItem, Shell, WindowState};
 use poly_ui::kit::widgets::{ButtonKind, CardHead};
 use poly_ui::kit::{Kit, KitInput, ToastKind};
-use poly_ui::primitives::Icon;
-use poly_ui::theme::{ACCENTS, Color, Theme};
+use poly_ui::primitives::{Icon, Shapes};
+use poly_ui::theme::{Color, GRADIENTS, Gradient, Theme};
 
 const PAGES: [(&str, Icon); 2] = [("Test inputs", Icon::Keyboard), ("Gallery", Icon::Grid)];
 
@@ -51,17 +55,25 @@ pub struct Page {
     gallery: GalleryState,
     search: String,
     fps: f32,
+    /// Seconds since start (drives the wallpaper drift).
+    time: f32,
+    backdrop: DrawList,
 }
 
 impl Page {
     pub fn new(scale: f32) -> Result<Self, String> {
+        let window = WindowState::default();
+        let mut theme = Theme::glass(window.gradient, scale);
+        theme.blur = window.blur;
         Ok(Self {
-            kit: Kit::new(Theme::dark(ACCENTS[0].1, scale))?,
-            shell: Shell::new(WindowState::default()),
+            kit: Kit::new(theme)?,
+            shell: Shell::new(window),
             inputs: Inputs::default(),
             gallery: GalleryState::default(),
             search: String::new(),
             fps: 0.0,
+            time: 0.0,
+            backdrop: DrawList::default(),
         })
     }
 
@@ -81,23 +93,28 @@ impl Page {
         [WindowState::MIN[0] * s + m, WindowState::MIN[1] * s + m]
     }
 
-    /// One frame; `margin` is 0 while maximised. Returns the draw list, texture changes
-    /// and whether the close button was pressed.
+    /// One frame; `margin` is 0 while maximised. Returns the backdrop (painted first, the
+    /// glass blurs it), the kit's draw list, texture changes and whether the close button
+    /// was pressed.
     pub fn frame(
         &mut self,
         input: KitInput,
         size: [u32; 2],
         margin: f32,
-    ) -> (&DrawList, Vec<TextureDelta>, bool) {
+    ) -> (&DrawList, &DrawList, Vec<TextureDelta>, bool) {
         if input.dt > 0.0 {
             let fps = 1.0 / input.dt;
             self.fps += (fps - self.fps) * if self.fps == 0.0 { 1.0 } else { 0.05 };
         }
+        self.time += input.dt;
         self.shell.host = Some(margin);
         self.kit.begin(input, size);
         let close = self.build(size);
+        let radius = self.kit.theme.pxf(self.kit.theme.radius.xl);
         let (list, textures) = self.kit.end();
-        (list, textures, close)
+        self.backdrop.clear();
+        wallpaper(&mut self.backdrop, self.shell.window(), radius, self.time);
+        (&self.backdrop, list, textures, close)
     }
 
     fn build(&mut self, size: [u32; 2]) -> bool {
@@ -234,15 +251,130 @@ impl Page {
             *s = Inputs::default();
             kit.toast("Values reset", ToastKind::Info);
         }
-        let names: Vec<&str> = ACCENTS.iter().map(|a| a.0).collect();
-        let mut accent = self.shell.state.accent.min(ACCENTS.len() - 1);
-        if kit.dropdown("Accent", &mut accent, &names) {
-            self.shell.state.accent = accent;
-            kit.theme.accent = ACCENTS[accent].1;
-        }
         kit.end_card();
 
-        kit.end_grid();
+        self.appearance();
+        self.kit.end_grid();
+    }
+
+    /// The accent gradient editor (preset, 1–6 stops, angle, hue shift), glass blur and
+    /// the compact sidebar, as in poly's Settings › Appearance.
+    fn appearance(&mut self) {
+        let kit = &mut self.kit;
+        kit.card(
+            CardHead {
+                title: "Appearance",
+                icon: Some(Icon::Palette),
+                hint: "Accent gradient, glass and sidebar.",
+                ..Default::default()
+            },
+            None,
+        );
+        let before = self.shell.state.gradient;
+        let mut g = before;
+        gradient_preview(kit);
+        let mut names: Vec<&str> = GRADIENTS.iter().map(|p| p.0).collect();
+        names.extend(["Single colour", "Custom"]);
+        let single = GRADIENTS.len();
+        let current = match g.preset_index() {
+            Some(i) => i,
+            None if g.count == 1 => single,
+            None => single + 1,
+        };
+        let mut pick = current;
+        if kit.dropdown("Accent", &mut pick, &names) && pick != current {
+            if pick < GRADIENTS.len() {
+                g = Gradient {
+                    angle: g.angle,
+                    hue_speed: g.hue_speed,
+                    ..Gradient::preset(pick)
+                };
+            } else if pick == single {
+                g.count = 1;
+            }
+        }
+        let mut count = g.count as i32;
+        if kit.slider_i32(
+            "Colour stops",
+            &mut count,
+            (1, Gradient::MAX_STOPS as i32),
+            1,
+            "",
+        ) {
+            g.set_count(count as usize);
+        }
+        let count = g.count;
+        kit.color_row("Colours", &mut g.stops[..count], &gallery::presets());
+        kit.hint("Click a swatch to edit that colour stop.");
+        if g.count > 1 {
+            kit.slider_f32("Gradient angle", &mut g.angle, (0.0, 360.0), 5.0, "°");
+        }
+        kit.slider_f32(
+            "Hue shift",
+            &mut g.hue_speed,
+            (0.0, Gradient::MAX_HUE_SPEED),
+            1.0,
+            "°/s",
+        );
+        if g != before {
+            self.shell.state.gradient = g;
+            kit.set_gradient(g);
+            self.shell.mark_changed();
+        }
+        let mut blur = self.shell.state.blur;
+        if kit.toggle("Background blur", &mut blur) {
+            self.shell.state.blur = blur;
+            kit.theme.blur = blur;
+            self.shell.mark_changed();
+        }
+        kit.hint("Frosted glass over the wallpaper; off = tinted glass without blur.");
+        let mut collapsed = self.shell.state.sidebar_collapsed;
+        if kit.toggle("Compact sidebar", &mut collapsed) {
+            self.shell.state.sidebar_collapsed = collapsed;
+            self.shell.mark_changed();
+        }
+        kit.end_card();
+    }
+}
+
+/// A wide capsule showing the current gradient as the controls use it.
+fn gradient_preview(kit: &mut Kit) {
+    let t = kit.theme.clone();
+    let row = kit.alloc(t.px(30.0));
+    let h = t.px(18.0);
+    let bar = Rect::new(row.min[0], (row.min[1] + t.px(5.0)).round(), row.width(), h);
+    kit.grad_glow(bar, h / 2.0, t.pxf(6.0), 0.3);
+    kit.grad_fill(bar, h / 2.0, 1.0, bar);
+    kit.dl()
+        .gradient_rounded(bar, h / 2.0, Color::WHITE.alpha(0.22).pm(), 0);
+    kit.lit_rim(bar, h / 2.0, 1.0);
+}
+
+/// What the glass of `window` blurs: a deep blue-violet base with large colour blobs that
+/// drift slowly with `time` (seconds). Blobs stay inside the window inset by its corner
+/// `radius`, so nothing shows past the rounded corners.
+fn wallpaper(list: &mut DrawList, window: Rect, radius: f32, time: f32) {
+    if window.width() <= 2.0 * radius || window.height() <= 2.0 * radius {
+        return;
+    }
+    list.fill_rounded(window, radius, Color::rgb(14, 16, 34).pm());
+    let inner = window.shrink(radius);
+    let (w, h) = (inner.width(), inner.height());
+    // (centre x, centre y, radius as part of the smaller side, colour, drift speed)
+    let blobs = [
+        (0.18, 0.22, 0.42, Color::rgb(255, 72, 140), 0.11),
+        (0.82, 0.18, 0.36, Color::rgb(58, 150, 255), 0.07),
+        (0.55, 0.62, 0.48, Color::rgb(126, 84, 255), 0.05),
+        (0.12, 0.85, 0.30, Color::rgb(0, 214, 190), 0.09),
+        (0.88, 0.80, 0.34, Color::rgb(255, 170, 60), 0.08),
+    ];
+    let side = w.min(h);
+    for (i, (x, y, r, color, speed)) in blobs.into_iter().enumerate() {
+        let phase = time * speed + i as f32 * 1.7;
+        let r = (side * r * 0.5).min(w / 2.0).min(h / 2.0);
+        let cx = inner.min[0] + (w * x + phase.sin() * w * 0.08).clamp(r, w - r);
+        let cy = inner.min[1] + (h * y + (phase * 1.3).cos() * h * 0.08).clamp(r, h - r);
+        list.circle([cx, cy], r, color.alpha(0.85).pm());
     }
 }
 
@@ -273,7 +405,7 @@ mod tests {
         assert!(margin > 0.0);
         for p in 0..PAGES.len() {
             page.shell.state.page = p;
-            let (list, _, close) = page.frame(at([-1.0, -1.0], false), SIZE, margin);
+            let (_, list, _, close) = page.frame(at([-1.0, -1.0], false), SIZE, margin);
             assert!(!list.commands.is_empty() && !close);
         }
         let window = page.shell.window();
@@ -290,14 +422,14 @@ mod tests {
             ..at([-1.0, -1.0], false)
         };
         assert!(
-            !page.frame(esc, SIZE, margin).2,
+            !page.frame(esc, SIZE, margin).3,
             "Esc keeps the window open"
         );
 
         let close = [caption.max[0] + 24.0, caption.min[1] + 24.0];
         let mut closed = false;
         for down in [false, true, false] {
-            closed |= page.frame(at(close, down), SIZE, margin).2;
+            closed |= page.frame(at(close, down), SIZE, margin).3;
         }
         assert!(closed, "close button");
     }
@@ -309,12 +441,13 @@ mod tests {
         let margin = page.shadow_margin();
         let mut textures = Vec::new();
         for _ in 0..3 {
-            textures.extend(page.frame(at([-1.0, -1.0], false), SIZE, margin).1);
+            textures.extend(page.frame(at([-1.0, -1.0], false), SIZE, margin).2);
         }
-        let (list, t, _) = page.frame(at([-1.0, -1.0], false), SIZE, margin);
+        let (backdrop, list, t, _) = page.frame(at([-1.0, -1.0], false), SIZE, margin);
         textures.extend(t);
         target.clear([0.0; 4]);
-        target.paint(&textures, list).unwrap();
+        target.paint(&textures, backdrop).unwrap();
+        target.paint(&[], list).unwrap();
         let px = target.pixels().unwrap();
         let alpha = |x: u32, y: u32| px[((y * SIZE[0] + x) * 4 + 3) as usize];
         assert_eq!(alpha(1, 1), 0, "transparent outside the shadow");

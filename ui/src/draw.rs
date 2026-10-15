@@ -6,7 +6,14 @@
 //! - `color` is premultiplied RGBA8 (`r | g << 8 | b << 16 | a << 24`), gamma-encoded
 //!   sRGB; texels too. Blend `ONE, ONE_MINUS_SRC_ALPHA`, sample as UNORM, multiply in
 //!   gamma space; only on an `_SRGB` target convert the result to linear before writing;
-//! - one scissor rectangle per [`DrawCmd`], no depth, no culling.
+//! - one scissor rectangle per [`DrawCmd`], no depth, no culling;
+//! - negative `uv.y` selects a built-in source instead of the command's texture (so glass
+//!   and gradients batch with text in the same draw calls):
+//!   - `uv.y` in `[-1.5, -0.5)` ([`BACKDROP_UV`]): the blurred back buffer behind the
+//!     pixel (screen position, linear filter); the backend fills it once per frame when
+//!     [`DrawList::backdrop`] is set, else a dark opaque texel;
+//!   - `uv.y < -1.5` ([`gradient_uv`]): the accent gradient [`GRADIENT_TEXTURE`] (a
+//!     256×1 lookup row) at `u = uv.x` (clamped to 0..1).
 
 use core::ops::Range;
 
@@ -42,6 +49,13 @@ impl Rect {
         Rect {
             min: [self.min[0] + by, self.min[1] + by],
             max: [self.max[0] - by, self.max[1] - by],
+        }
+    }
+    /// Smallest rectangle containing both.
+    pub fn union(&self, o: &Rect) -> Rect {
+        Rect {
+            min: [self.min[0].min(o.min[0]), self.min[1].min(o.min[1])],
+            max: [self.max[0].max(o.max[0]), self.max[1].max(o.max[1])],
         }
     }
     /// Pixel scissor `[left, top, right, bottom]` clamped to `size`; `None` when empty.
@@ -80,6 +94,18 @@ pub struct TextureId(pub u32);
 
 /// The font atlas (texel [0, 0] is opaque white for solid fills).
 pub const FONT_TEXTURE: TextureId = TextureId(0);
+/// The accent gradient: 256×1 premultiplied RGBA8, sampled through [`gradient_uv`].
+pub const GRADIENT_TEXTURE: TextureId = TextureId(1);
+/// Width of [`GRADIENT_TEXTURE`].
+pub const GRADIENT_WIDTH: u32 = 256;
+
+/// UV that samples the blurred back buffer at the pixel's own screen position.
+pub const BACKDROP_UV: [f32; 2] = [-1.0, -1.0];
+
+/// UV that samples the accent gradient at `t` (0 = first stop, 1 = last).
+pub const fn gradient_uv(t: f32) -> [f32; 2] {
+    [t, -2.0]
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct DrawCmd {
@@ -114,6 +140,9 @@ pub struct DrawList {
     pub vertices: Vec<Vertex>,
     pub indices: Vec<u32>,
     pub commands: Vec<DrawCmd>,
+    /// Union of every shape that samples [`BACKDROP_UV`] (pixels); `None` = the backend
+    /// skips the back-buffer copy and blur entirely.
+    pub backdrop: Option<Rect>,
     clip: Vec<Rect>,
 }
 
@@ -132,6 +161,9 @@ impl DrawList {
             texture: c.texture,
             indices: c.indices.start + base_i..c.indices.end + base_i,
         }));
+        if let Some(r) = other.backdrop {
+            self.add_backdrop(r);
+        }
     }
 
     pub fn clear(&mut self) {
@@ -139,6 +171,15 @@ impl DrawList {
         self.indices.clear();
         self.commands.clear();
         self.clip.clear();
+        self.backdrop = None;
+    }
+
+    /// Marks `rect` as sampling the blurred back buffer.
+    pub fn add_backdrop(&mut self, rect: Rect) {
+        self.backdrop = Some(match self.backdrop {
+            Some(r) => r.union(&rect),
+            None => rect,
+        });
     }
 
     pub fn push_clip(&mut self, rect: Rect) {

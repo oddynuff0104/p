@@ -117,8 +117,14 @@ impl Gpu {
         Ok(())
     }
 
-    /// Clears to transparent, draws one frame and presents it on the next vblank.
-    pub fn frame(&mut self, textures: &[TextureDelta], list: &DrawList) -> Result<(), String> {
+    /// Clears to transparent, paints `backdrop` (what the glass blurs) and then `list`, and
+    /// presents the frame on the next vblank.
+    pub fn frame(
+        &mut self,
+        textures: &[TextureDelta],
+        backdrop: &DrawList,
+        list: &DrawList,
+    ) -> Result<(), String> {
         // SAFETY: Buffer 0 is the current back buffer of a flip-model swapchain.
         let buffer: ID3D11Texture2D =
             unsafe { self.swapchain.GetBuffer(0) }.map_err(err("GetBuffer"))?;
@@ -126,7 +132,8 @@ impl Gpu {
         // SAFETY: The view is owned and live; the colour array outlives the call.
         unsafe { self.context.ClearRenderTargetView(&rtv, &[0.0; 4]) };
         drop(rtv);
-        self.renderer.paint(&buffer, textures, list, self.size)?;
+        self.renderer.paint(&buffer, textures, backdrop, self.size)?;
+        self.renderer.paint(&buffer, &[], list, self.size)?;
         drop(buffer);
         // SAFETY: The swapchain is live; presenting needs no other arguments.
         unsafe { self.swapchain.Present(1, DXGI_PRESENT(0)) }

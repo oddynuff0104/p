@@ -15,9 +15,11 @@ mod tests;
 
 use std::collections::HashMap;
 
-use crate::draw::{DrawList, Rect, TextureDelta};
-use crate::primitives::{Icon, Shapes};
-use crate::theme::{Color, TextStyle, Theme};
+use super::draw::{
+    BACKDROP_UV, DrawList, GRADIENT_TEXTURE, GRADIENT_WIDTH, Rect, TextureDelta, gradient_uv,
+};
+use super::primitives::{Corners, GradMap, Icon, Shapes};
+use super::theme::{Color, GlassKind, Gradient, TextStyle, Theme};
 use text::FontSet;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,6 +96,23 @@ struct Toast {
 }
 
 pub const TOAST_SECONDS: f32 = 4.0;
+
+/// Premultiplied `a` over `b`.
+fn pm_over(a: u32, b: u32) -> u32 {
+    let inv = 255 - (a >> 24);
+    let ch = |s: u32| {
+        let (x, y) = ((a >> s) & 0xFF, (b >> s) & 0xFF);
+        (x + (y * inv + 127) / 255).min(255)
+    };
+    ch(0) | ch(8) << 8 | ch(16) << 16 | ch(24) << 24
+}
+
+/// 0 → 1 with a small overshoot (springy entrances); clamps outside 0..1.
+pub(crate) fn ease_out_back(x: f32) -> f32 {
+    let x = x.clamp(0.0, 1.0);
+    let (c1, c3) = (1.4, 2.4);
+    1.0 + c3 * (x - 1.0).powi(3) + c1 * (x - 1.0).powi(2)
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Layer {
@@ -177,6 +196,10 @@ pub struct Kit {
     /// Area a modal scrim covers and toasts stack in (the window; screen by default).
     pub modal_area: Option<Rect>,
     anims: HashMap<Id, f32>,
+    /// Spring state (position, velocity) per id.
+    springs: HashMap<Id, [f32; 2]>,
+    /// Gradient and hue phase the lookup texture currently holds.
+    lut: Option<(Gradient, f32)>,
     pub heights: HashMap<Id, f32>,
     scroll: HashMap<Id, f32>,
     ids: Vec<Id>,
@@ -212,10 +235,18 @@ impl Kit {
     /// Rasterises the font sizes of `theme`; the atlas upload is in the first frame.
     pub fn new(theme: Theme) -> Result<Self, String> {
         let (fonts, atlas) = FontSet::new(&theme)?;
+        let lut = TextureDelta::Create {
+            id: GRADIENT_TEXTURE,
+            size: [GRADIENT_WIDTH, 1],
+            rgba: theme.gradient.lut(0.0),
+            nearest: false,
+        };
         Ok(Self {
+            lut: Some((theme.gradient, 0.0)),
+            springs: HashMap::new(),
             theme,
             fonts,
-            textures: vec![atlas],
+            textures: vec![atlas, lut],
             list: DrawList::default(),
             overlay: DrawList::default(),
             top: DrawList::default(),
@@ -296,6 +327,7 @@ impl Kit {
         self.input = input;
         self.input.dt = self.input.dt.clamp(0.0, 0.25);
         self.time += self.input.dt;
+        self.update_gradient();
         self.size = [size_px[0] as f32, size_px[1] as f32];
         let down = self.input.down[0];
         self.mouse_pressed = down && !self.prev_down;
@@ -520,6 +552,57 @@ impl Kit {
         self.anim(key, if on { 1.0 } else { 0.0 })
     }
 
+    /// Damped spring toward `target` (frame-rate independent, slight overshoot): springy
+    /// hover/press/toggle motion that still settles in about a quarter second.
+    pub fn spring(&mut self, key: Id, target: f32) -> f32 {
+        let [k, zeta] = self.theme.spring;
+        let damping = 2.0 * k.sqrt() * zeta;
+        let dt = self.input.dt;
+        let s = self.springs.entry(key).or_insert([target, 0.0]);
+        if dt > 0.0 {
+            let n = (dt * 240.0).ceil().clamp(1.0, 240.0);
+            let h = dt / n;
+            for _ in 0..n as usize {
+                let a = k * (target - s[0]) - damping * s[1];
+                s[1] += a * h;
+                s[0] += s[1] * h;
+            }
+            if (target - s[0]).abs() < 1e-3 && s[1].abs() < 1e-2 {
+                *s = [target, 0.0];
+            }
+        }
+        s[0]
+    }
+    pub fn spring_bool(&mut self, key: Id, on: bool) -> f32 {
+        self.spring(key, if on { 1.0 } else { 0.0 })
+    }
+
+    /// Sets the accent gradient (the lookup texture follows in the next frame).
+    pub fn set_gradient(&mut self, gradient: Gradient) {
+        self.theme.gradient = gradient;
+        self.update_gradient();
+    }
+
+    /// Hue phase, mean accent and the lookup row for this frame (a 1 KiB texture update
+    /// only when the gradient or its animated hue changed).
+    fn update_gradient(&mut self) {
+        let g = self.theme.gradient;
+        // Quantised so a static gradient never re-uploads.
+        let phase = (g.phase(self.time) * 1024.0).round() / 1024.0;
+        self.theme.phase = phase;
+        if self.lut == Some((g, phase)) {
+            return;
+        }
+        self.theme.accent = g.average(phase);
+        self.lut = Some((g, phase));
+        self.textures.push(TextureDelta::Update {
+            id: GRADIENT_TEXTURE,
+            pos: [0, 0],
+            size: [GRADIENT_WIDTH, 1],
+            rgba: g.lut(phase),
+        });
+    }
+
     // ------------------------------------------------------------------ drawing
 
     pub fn dl(&mut self) -> &mut DrawList {
@@ -574,17 +657,124 @@ impl Kit {
         let (s, w) = (self.theme.pxf(size_pt), self.theme.pxf(1.6).max(1.0));
         self.dl().icon(icon, center, s, w, color.pm());
     }
-    /// Focus ring around `rect` while keyboard navigation is in use.
+    /// Focus ring around `rect` while keyboard navigation is in use: a gradient rim with
+    /// a soft glow.
     pub fn focus_ring(&mut self, id: Id, rect: Rect, radius: f32) {
         if self.focus == id && self.focus_visible {
-            let g = self.theme.pxf(2.0);
+            let g = self.theme.pxf(2.5);
             let r = Rect {
                 min: [rect.min[0] - g, rect.min[1] - g],
                 max: [rect.max[0] + g, rect.max[1] + g],
             };
-            let c = self.theme.accent.alpha(0.8).pm();
             let w = self.theme.pxf(1.5);
-            self.dl().stroke_rounded(r, radius + g, w, c);
+            self.grad_glow(r, radius + g, self.theme.pxf(6.0), 0.35);
+            self.grad_stroke(r, radius + g, w, 0.95, r);
+        }
+    }
+
+    // ------------------------------------------------------------------ glass, gradient
+
+    /// Gradient mapping across `span` at the theme angle.
+    pub fn grad_map(&self, span: Rect) -> GradMap {
+        GradMap::over(span, self.theme.gradient.angle)
+    }
+
+    /// Rounded fill with the accent gradient laid across `span`, at `alpha`.
+    pub fn grad_fill(&mut self, rect: Rect, corners: impl Into<Corners>, alpha: f32, span: Rect) {
+        let map = self.grad_map(span);
+        let dl = self.dl();
+        let start = dl.vertices.len();
+        dl.fill_rounded(rect, corners, Color::WHITE.alpha(alpha).pm());
+        dl.uv_from(start, &|p| gradient_uv(map.t(p)));
+    }
+
+    /// Rounded border with the accent gradient laid across `span`.
+    pub fn grad_stroke(&mut self, rect: Rect, radius: f32, width: f32, alpha: f32, span: Rect) {
+        let map = self.grad_map(span);
+        let dl = self.dl();
+        let start = dl.vertices.len();
+        dl.stroke_rounded(rect, radius, width, Color::WHITE.alpha(alpha).pm());
+        dl.uv_from(start, &|p| gradient_uv(map.t(p)));
+    }
+
+    /// Soft gradient halo of `spread` px around a rounded rect.
+    pub fn grad_glow(&mut self, rect: Rect, radius: f32, spread: f32, alpha: f32) {
+        let map = self.grad_map(rect);
+        let dl = self.dl();
+        let start = dl.vertices.len();
+        let c = Color::WHITE.alpha(alpha).pm();
+        dl.band_rounded(rect, radius, [0.0, spread], c, 0);
+        dl.uv_from(start, &|p| gradient_uv(map.t(p)));
+    }
+
+    /// Specular rim of a glass surface: bright where the outline faces the light (top
+    /// left), a faint reflection bottom right.
+    pub fn lit_rim(&mut self, rect: Rect, radius: f32, strength: f32) {
+        let t = &self.theme;
+        let (hi, lo) = (
+            t.rim_light.0[3] as f32 / 255.0 * strength,
+            t.rim_shade.0[3] as f32 / 255.0 * strength,
+        );
+        let w = t.pxf(1.0).max(1.0);
+        self.dl().stroke_rounded_lit(rect, radius, w, &|_, n| {
+            let lit = (-0.42 * n[0] - 0.91 * n[1]).max(0.0);
+            let shade = (0.42 * n[0] + 0.91 * n[1]).max(0.0);
+            let a = (hi * lit * lit.sqrt() + lo * shade + lo * 0.6).min(1.0);
+            Color::WHITE.alpha(a).pm()
+        });
+    }
+
+    /// A glass surface: depth shadow, blurred backdrop (when blur is on), tint, sheen,
+    /// inner glow and lit rim; the window also gets the gradient rim and glow. `fade`
+    /// scales everything (tooltips and toasts fading in and out).
+    pub fn glass(&mut self, rect: Rect, radius: f32, kind: GlassKind, fade: f32) {
+        if fade <= 0.0 || rect.width() <= 0.0 || rect.height() <= 0.0 {
+            return;
+        }
+        let t = self.theme.clone();
+        let (sh, contact) = match kind {
+            GlassKind::Window => (t.shadow_window, 0.30),
+            GlassKind::Popup => (t.shadow_popup, 0.28),
+            GlassKind::Platter => (t.shadow_card, 0.0),
+        };
+        let off = [t.pxf(sh.offset[0]), t.pxf(sh.offset[1])];
+        let dl = self.dl();
+        dl.shadow(rect, radius, t.pxf(sh.blur), off, sh.color.alpha(fade).pm());
+        if contact > 0.0 {
+            let c = Color::BLACK.alpha(contact * fade).pm();
+            dl.shadow(rect, radius, t.pxf(5.0), [0.0, t.pxf(1.5)], c);
+        }
+        if kind == GlassKind::Window {
+            self.grad_glow(rect, radius, t.pxf(26.0), 0.16 * fade);
+        }
+        let dl = self.dl();
+        if kind == GlassKind::Platter {
+            dl.fill_rounded(rect, radius, t.platter.alpha(fade).pm());
+        } else {
+            if t.blur {
+                let start = dl.vertices.len();
+                dl.fill_rounded(rect, radius, Color::WHITE.alpha(fade).pm());
+                dl.uv_from(start, &|_| BACKDROP_UV);
+                dl.add_backdrop(rect);
+            }
+            // Tint with the sheen (light falling in from the top) folded in: one layer.
+            let tint = t.glass_tint.alpha(t.tint_alpha(kind) * fade).pm();
+            let top = pm_over(Color::WHITE.alpha(0.06 * fade).pm(), tint);
+            dl.gradient_rounded(rect, radius, top, tint);
+            // Inner glow along the edge.
+            let glow = Color::WHITE.alpha(0.035 * fade).pm();
+            dl.band_rounded(rect, radius, [0.0, -t.pxf(10.0)], glow, 0);
+        }
+        if kind == GlassKind::Window {
+            self.grad_stroke(rect, radius, t.pxf(1.5).max(1.0), 0.85 * fade, rect);
+            self.lit_rim(rect.shrink(1.5), (radius - 1.5).max(0.0), fade);
+        } else {
+            let s = if kind == GlassKind::Platter {
+                0.55
+            } else {
+                1.0
+            };
+            self.lit_rim(rect, radius, s * fade);
         }
     }
 
@@ -701,24 +891,10 @@ impl Kit {
         };
         self.heights.insert(card.id, rect.height());
         let content = std::mem::replace(&mut self.list, card.saved);
-        let t = &self.theme;
-        let (radius, sh) = (t.pxf(t.radius.lg), t.shadow_card);
-        let (blur, off) = (t.pxf(sh.blur), [t.pxf(sh.offset[0]), t.pxf(sh.offset[1])]);
-        let (shadow, surface, border, hl) = (
-            sh.color.pm(),
-            t.surface.pm(),
-            t.border.pm(),
-            Color::rgba(255, 255, 255, 10).pm(),
-        );
-        self.list.shadow(rect, radius, blur, off, shadow);
-        self.list.fill_rounded(rect, radius, surface);
-        self.list.stroke_rounded(rect, radius, 1.0, border);
-        // Subtle top highlight: lit edge as on raised glass.
-        let hl_rect = Rect {
-            min: [rect.min[0] + radius, rect.min[1]],
-            max: [rect.max[0] - radius, rect.min[1] + 1.0],
-        };
-        self.list.rect(hl_rect, hl);
+        let radius = self.theme.pxf(self.theme.radius.lg);
+        let layer = std::mem::replace(&mut self.layer, Layer::Base);
+        self.glass(rect, radius, GlassKind::Platter, 1.0);
+        self.layer = layer;
         self.list.append(&content);
         self.pool.push(content);
         match (card.column, self.grids.last_mut()) {
@@ -771,7 +947,7 @@ impl Kit {
                 .unwrap_or(off);
             let y = s.rect.min[1] + (track - thumb) * (shown / max).clamp(0.0, 1.0);
             let r = Rect::new(s.rect.max[0] - w - t.px(3.0), y, w, thumb);
-            let c = t.border_strong.pm();
+            let c = Color::WHITE.alpha(0.22).pm();
             self.dl().fill_rounded(r, w / 2.0, c);
         }
     }
@@ -821,18 +997,14 @@ impl Kit {
         let r = t.pxf(t.radius.md);
         let layer = self.layer;
         self.layer = Layer::Top;
-        let sh = t.shadow_popup;
-        self.top.shadow(
-            rect,
-            r,
-            t.pxf(sh.blur),
-            [0.0, t.pxf(sh.offset[1])],
-            sh.color.alpha(fade).pm(),
-        );
-        self.top
-            .fill_rounded(rect, r, t.surface_raised.alpha(fade).pm());
-        self.top
-            .stroke_rounded(rect, r, 1.0, t.border_strong.alpha(fade).pm());
+        // Pop in: a short springy scale.
+        let pop = ease_out_back((self.hover_t - self.theme.tooltip_delay) / 0.2);
+        let grow = (1.0 - pop) * t.pxf(6.0);
+        let rect = Rect {
+            min: [rect.min[0] + grow, rect.min[1] + grow],
+            max: [rect.max[0] - grow, rect.max[1] - grow],
+        };
+        self.glass(rect, r, GlassKind::Popup, fade);
         for (i, line) in lines.iter().enumerate() {
             let pos = [
                 x + pad[0],
@@ -882,38 +1054,29 @@ impl Kit {
             .map(|t| (t.text.clone(), t.kind, t.age))
             .collect();
         for (text, kind, age) in toasts {
-            let enter = (age / 0.18).clamp(0.0, 1.0);
-            let ease = 1.0 - (1.0 - enter).powi(3);
-            let fade = ease * ((TOAST_SECONDS - age) / 0.3).clamp(0.0, 1.0);
-            let x = area.max[0] - t.sp(5) - w + (1.0 - ease) * t.px(40.0);
+            let enter = (age / 0.32).clamp(0.0, 1.0);
+            let fade_in = 1.0 - (1.0 - (age / 0.16).clamp(0.0, 1.0)).powi(3);
+            let fade = fade_in * ((TOAST_SECONDS - age) / 0.3).clamp(0.0, 1.0);
+            let x = area.max[0] - t.sp(5) - w + (1.0 - ease_out_back(enter)) * t.px(48.0);
             let rect = Rect::new(x.round(), (y - h).round(), w, h);
             let (icon, color) = match kind {
                 ToastKind::Success => (Icon::Check, t.success),
                 ToastKind::Error => (Icon::Warning, t.danger),
-                ToastKind::Info => (Icon::Info, t.accent),
+                ToastKind::Info => (Icon::Info, t.accent_text()),
             };
-            let r = t.pxf(t.radius.lg);
-            let sh = t.shadow_popup;
-            self.top.shadow(
-                rect,
-                r,
-                t.pxf(sh.blur),
-                [0.0, t.pxf(sh.offset[1])],
-                sh.color.alpha(fade).pm(),
-            );
-            self.top
-                .fill_rounded(rect, r, t.surface_raised.alpha(fade).pm());
-            self.top
-                .stroke_rounded(rect, r, 1.0, t.border_strong.alpha(fade).pm());
-            let bar = Rect::new(rect.min[0], rect.min[1], t.px(3.0), h);
-            self.top.fill_rounded(
-                bar,
-                crate::primitives::Corners::left(r),
-                color.alpha(fade).pm(),
-            );
+            let r = h / 2.0;
+            self.glass(rect, r, GlassKind::Popup, fade);
             let cy = rect.min[1] + h / 2.0;
-            let ix = rect.min[0] + t.sp(4) + t.px(8.0);
-            self.icon(icon, [ix, cy], 16.0, color.alpha(fade));
+            let ix = rect.min[0] + t.sp(3) + t.px(12.0);
+            let disc = t.px(14.0);
+            if kind == ToastKind::Info {
+                let d = Rect::new(ix - disc, cy - disc, disc * 2.0, disc * 2.0);
+                self.grad_fill(d, disc, 0.30 * fade, d);
+            } else {
+                self.top
+                    .circle([ix, cy], disc, color.alpha(0.20 * fade).pm());
+            }
+            self.icon(icon, [ix, cy], 15.0, color.alpha(fade));
             let tx = ix + t.px(8.0) + t.sp(3);
             let max = rect.max[0] - tx - t.sp(3);
             self.text_fit(TextStyle::Body, tx, cy, &text, max, t.text.alpha(fade));

@@ -30,12 +30,6 @@ impl Corners {
     pub const fn top(r: f32) -> Self {
         Self([r, r, 0.0, 0.0])
     }
-    pub const fn bottom(r: f32) -> Self {
-        Self([0.0, 0.0, r, r])
-    }
-    pub const fn left(r: f32) -> Self {
-        Self([r, 0.0, 0.0, r])
-    }
     fn clamped(self, rect: &Rect) -> Self {
         let m = (rect.width().min(rect.height()) / 2.0).max(0.0);
         Self(self.0.map(|r| r.clamp(0.0, m)))
@@ -234,6 +228,57 @@ pub trait Shapes {
     fn shadow(&mut self, rect: Rect, radius: f32, blur: f32, offset: P, color: u32);
     /// `icon` centred in a square of `size` px with stroke `width` px.
     fn icon(&mut self, icon: Icon, center: P, size: f32, width: f32, color: u32);
+    /// Polyline whose colour depends on the point and its outward unit normal (lit rims).
+    fn polyline_lit(&mut self, pts: &[P], closed: bool, width: f32, color: &dyn Fn(P, P) -> u32);
+    /// Border like [`Self::stroke_rounded`] with a per-point colour `color(p, normal)`.
+    fn stroke_rounded_lit(
+        &mut self,
+        rect: Rect,
+        corners: impl Into<Corners>,
+        width: f32,
+        color: &dyn Fn(P, P) -> u32,
+    );
+    /// Soft band along the outline of a rounded rect from offset `d0` to `d1` px along the
+    /// outward normal (negative = inside), colour `c0` fading to `c1` (inner glow, halo).
+    fn band_rounded(
+        &mut self,
+        rect: Rect,
+        corners: impl Into<Corners>,
+        d: [f32; 2],
+        c0: u32,
+        c1: u32,
+    );
+    /// Replaces the UVs of every vertex from index `start` on (glass, gradients).
+    fn uv_from(&mut self, start: usize, uv: &dyn Fn(P) -> [f32; 2]);
+}
+
+/// Linear gradient mapping: `t = dot(p - origin, dir)` (0 at one side of the span,
+/// 1 at the other), CSS-style angle (0° = left → right, 90° = top → bottom).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GradMap {
+    origin: P,
+    dir: P,
+}
+
+impl GradMap {
+    /// Gradient across `span` at `angle_deg`.
+    pub fn over(span: Rect, angle_deg: f32) -> Self {
+        let a = angle_deg.to_radians();
+        let d = [a.cos(), a.sin()];
+        let c = [
+            (span.min[0] + span.max[0]) / 2.0,
+            (span.min[1] + span.max[1]) / 2.0,
+        ];
+        let half = (span.width() / 2.0 * d[0].abs() + span.height() / 2.0 * d[1].abs()).max(0.5);
+        let dir = [d[0] / (2.0 * half), d[1] / (2.0 * half)];
+        Self {
+            origin: [c[0] - d[0] * half, c[1] - d[1] * half],
+            dir,
+        }
+    }
+    pub fn t(&self, p: P) -> f32 {
+        (p[0] - self.origin[0]) * self.dir[0] + (p[1] - self.origin[1]) * self.dir[1]
+    }
 }
 
 impl Shapes for DrawList {
@@ -345,15 +390,22 @@ impl Shapes for DrawList {
     }
 
     fn polyline(&mut self, pts: &[P], closed: bool, width: f32, color: u32) {
+        if color >> 24 == 0 {
+            return;
+        }
+        self.polyline_lit(pts, closed, width, &|_, _| color);
+    }
+
+    fn polyline_lit(&mut self, pts: &[P], closed: bool, width: f32, color: &dyn Fn(P, P) -> u32) {
         let n = pts.len();
-        if n < 2 || color >> 24 == 0 {
+        if n < 2 {
             return;
         }
         // Thin lines: keep a 1 px core and fade the coverage instead of thinning.
-        let (core, color) = if width < 1.0 {
-            (0.5, premul_scale(color, width))
+        let (core, fade) = if width < 1.0 {
+            (0.5, width)
         } else {
-            ((width - 1.0) * 0.5 + 0.5, color)
+            ((width - 1.0) * 0.5 + 0.5, 1.0)
         };
         let half_core = (core - 0.5).max(0.0);
         let outer = half_core + 1.0;
@@ -363,9 +415,11 @@ impl Shapes for DrawList {
             let d = norm([b[0] - a[0], b[1] - a[1]]);
             [d[1], -d[0]]
         };
+        // 1 px lines have a zero-width core: three vertices per point, two strips.
+        let thin = half_core <= 0.0;
+        let per = if thin { 3 } else { 4 };
         let base = self.vertices.len() as u32;
-        self.begin_shapes((segs * 18) as u32);
-        let clear = premul_scale(color, 0.0);
+        self.begin_shapes((segs * 6 * (per - 1)) as u32);
         for (i, &p) in pts.iter().enumerate() {
             let m = if !closed && i == 0 {
                 seg_normal(0)
@@ -382,20 +436,97 @@ impl Shapes for DrawList {
                 m
             };
             let at = |d: f32| [p[0] + m[0] * d, p[1] + m[1] * d];
-            self.vertices.extend([
-                vertex(at(outer), clear),
-                vertex(at(half_core), color),
-                vertex(at(-half_core), color),
-                vertex(at(-outer), clear),
-            ]);
+            let c = color(p, norm(m));
+            let c = if fade < 1.0 { premul_scale(c, fade) } else { c };
+            self.vertices.push(vertex(at(outer), 0));
+            self.vertices.push(vertex(at(half_core), c));
+            if !thin {
+                self.vertices.push(vertex(at(-half_core), c));
+            }
+            self.vertices.push(vertex(at(-outer), 0));
         }
+        let per = per as u32;
         for s in 0..segs as u32 {
-            let a = base + 4 * s;
-            let b = base + 4 * ((s + 1) % n as u32);
-            for k in 0..3 {
+            let a = base + per * s;
+            let b = base + per * ((s + 1) % n as u32);
+            for k in 0..per - 1 {
                 self.indices
                     .extend([a + k, a + k + 1, b + k + 1, a + k, b + k + 1, b + k]);
             }
+        }
+    }
+
+    fn stroke_rounded_lit(
+        &mut self,
+        rect: Rect,
+        corners: impl Into<Corners>,
+        width: f32,
+        color: &dyn Fn(P, P) -> u32,
+    ) {
+        let h = width * 0.5;
+        let inner = rect.shrink(h);
+        let c = corners.into();
+        let c = Corners(c.0.map(|r| (r - h).max(0.0)));
+        with_path(|path| {
+            rounded_path(path, inner, c);
+            self.polyline_lit(path, true, width, color);
+        });
+    }
+
+    fn band_rounded(
+        &mut self,
+        rect: Rect,
+        corners: impl Into<Corners>,
+        d: [f32; 2],
+        c0: u32,
+        c1: u32,
+    ) {
+        if (c0 | c1) >> 24 == 0 || rect.width() <= 0.0 || rect.height() <= 0.0 {
+            return;
+        }
+        let corners = corners.into();
+        with_path(|path| {
+            rounded_path(path, rect, corners);
+            let n = path.len();
+            if n < 3 {
+                return;
+            }
+            let mut normals = Vec::new();
+            SCRATCH.with(|s| {
+                if let Ok(mut s) = s.try_borrow_mut() {
+                    normals = std::mem::take(&mut s.1);
+                }
+            });
+            vertex_normals(path, &mut normals);
+            let base = self.vertices.len() as u32;
+            self.begin_shapes((n * 6) as u32);
+            for (p, m) in path.iter().zip(&normals) {
+                self.vertices
+                    .push(vertex([p[0] + m[0] * d[0], p[1] + m[1] * d[0]], c0));
+                self.vertices
+                    .push(vertex([p[0] + m[0] * d[1], p[1] + m[1] * d[1]], c1));
+            }
+            for i in 0..n as u32 {
+                let j = (i + 1) % n as u32;
+                let (a0, a1, b0, b1) = (
+                    base + 2 * i,
+                    base + 2 * i + 1,
+                    base + 2 * j,
+                    base + 2 * j + 1,
+                );
+                self.indices.extend([a0, a1, b1, a0, b1, b0]);
+            }
+            SCRATCH.with(|s| {
+                if let Ok(mut s) = s.try_borrow_mut() {
+                    s.1 = normals;
+                }
+            });
+        });
+    }
+
+    fn uv_from(&mut self, start: usize, uv: &dyn Fn(P) -> [f32; 2]) {
+        for v in self.vertices.iter_mut().skip(start) {
+            v.uv = uv(v.pos);
         }
     }
 

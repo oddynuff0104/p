@@ -6,6 +6,10 @@
 //! index buffer (grown on demand); one scissor rectangle per primitive. Textures are
 //! RGBA8 UNORM, sampled point or linear per texture; on an `_SRGB` backbuffer the
 //! pixel shader converts the gamma-space result to linear before writing.
+//! Glass: when the list has a `backdrop` region, the back buffer under it is copied (or
+//! read directly when shader-readable), downsampled to ¼ and Gaussian-blurred in three
+//! small passes before the menu draws; shapes with `BACKDROP_UV` sample the result, shapes
+//! with `gradient_uv` the accent gradient row (see `menu::draw`).
 //! COM bindings: the `windows` crate (owned references drop with their values).
 
 use core::ffi::{CStr, c_void};
@@ -15,26 +19,33 @@ use windows::Win32::Foundation::{E_POINTER, HMODULE, RECT};
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE, D3D_DRIVER_TYPE_WARP, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
-    D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, ID3DBlob,
+    D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, D3D_SRV_DIMENSION_TEXTURE2D, ID3DBlob,
 };
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_R8G8B8A8_UNORM,
-    DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32G32_FLOAT,
-    DXGI_SAMPLE_DESC,
+    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_TYPELESS, DXGI_FORMAT_B8G8R8A8_UNORM,
+    DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_R8G8B8A8_TYPELESS, DXGI_FORMAT_R8G8B8A8_UNORM,
+    DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R32_UINT,
+    DXGI_FORMAT_R32G32_FLOAT, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::IDXGIAdapter;
 use windows::core::{Interface, PCSTR};
 
 use super::context_state::{ContextState, create_context_state};
 use super::hr;
-use crate::draw::{DrawList, TextureDelta, TextureId, Vertex};
+use crate::draw::{DrawList, GRADIENT_TEXTURE, TextureDelta, TextureId, Vertex};
 use crate::render::MenuRenderer;
 
 const SHADER: &str = r#"
-cbuffer Screen : register(b0) { float2 screen_points; float srgb_target; float pad; };
+cbuffer Screen : register(b0) {
+    float2 screen_points; float srgb_target; float pad;
+    float2 backdrop_scale; float2 pad2;
+};
 Texture2D tex : register(t0);
+Texture2D backdrop : register(t1);
+Texture2D lut : register(t2);
 SamplerState samp : register(s0);
+SamplerState lin : register(s1);
 
 struct VsIn { float2 pos : POSITION; float2 uv : TEXCOORD; float4 color : COLOR; };
 struct PsIn { float4 pos : SV_POSITION; float2 uv : TEXCOORD; float4 color : COLOR; };
@@ -51,14 +62,75 @@ float3 to_linear(float3 c) {
     return lerp(pow((c + 0.055) / 1.055, 2.4), c / 12.92, step(c, 0.04045));
 }
 
+// uv.y < -1.5: accent gradient at u; -1.5 <= uv.y < -0.5: blurred backdrop at the pixel.
 float4 ps_main(PsIn i) : SV_Target {
-    float4 c = i.color * tex.Sample(samp, i.uv);
+    float4 a = tex.Sample(samp, i.uv);
+    float4 b = backdrop.SampleLevel(lin, i.pos.xy * backdrop_scale, 0);
+    float u = saturate(i.uv.x) * (255.0 / 256.0) + (0.5 / 256.0);
+    float4 g = lut.SampleLevel(lin, float2(u, 0.5), 0);
+    float4 t = i.uv.y < -1.5 ? g : (i.uv.y < -0.5 ? b : a);
+    float4 c = i.color * t;
     if (srgb_target > 0.5 && c.a > 0.0) {
         c.rgb = to_linear(c.rgb / c.a) * c.a;
     }
     return c;
 }
 "#;
+
+/// Backdrop blur: copy → ¼ downsample with vibrancy → separable 13-tap Gaussian (7
+/// bilinear fetches per direction) at ¼ resolution, all scissored to the glass region.
+const BLUR_SHADER: &str = r#"
+cbuffer Blur : register(b0) { float2 src_texel; float2 dir; float2 uv_scale; float2 pad; };
+Texture2D src : register(t0);
+SamplerState lin : register(s0);
+
+struct V { float4 pos : SV_POSITION; float2 uv : TEXCOORD; };
+
+V vs_full(uint id : SV_VertexID) {
+    V o;
+    float2 p = float2((id << 1) & 2, id & 2);
+    o.pos = float4(p.x * 2.0 - 1.0, 1.0 - p.y * 2.0, 0.0, 1.0);
+    o.uv = p;
+    return o;
+}
+
+// 4 bilinear taps = the 4x4 block under the quarter pixel. Then a little more colour
+// and a soft luminance cap, so glass stays dark enough for white text on bright maps.
+float4 ps_down(V i) : SV_Target {
+    float2 uv = i.uv * uv_scale;
+    float3 c = src.SampleLevel(lin, uv + src_texel * float2(-1.0, -1.0), 0).rgb
+             + src.SampleLevel(lin, uv + src_texel * float2( 1.0, -1.0), 0).rgb
+             + src.SampleLevel(lin, uv + src_texel * float2(-1.0,  1.0), 0).rgb
+             + src.SampleLevel(lin, uv + src_texel * float2( 1.0,  1.0), 0).rgb;
+    c *= 0.25;
+    float l = dot(c, float3(0.2126, 0.7152, 0.0722));
+    c = max(lerp(l.xxx, c, 1.2), 0.0);
+    c *= 1.0 / (1.0 + 1.5 * l);
+    return float4(c, 1.0);
+}
+
+static const float W[4] = { 0.19648255, 0.29690696, 0.09447040, 0.01038136 };
+static const float O[4] = { 0.0, 1.41176471, 3.29411765, 5.17647059 };
+
+float4 ps_blur(V i) : SV_Target {
+    float3 c = src.SampleLevel(lin, i.uv, 0).rgb * W[0];
+    [unroll] for (int k = 1; k < 4; k++) {
+        float2 o = dir * O[k];
+        c += src.SampleLevel(lin, i.uv + o, 0).rgb * W[k];
+        c += src.SampleLevel(lin, i.uv - o, 0).rgb * W[k];
+    }
+    return float4(c, 1.0);
+}
+"#;
+
+/// Blur radius multiplier of the Gaussian offsets (quarter-resolution texels).
+const BLUR_SPREAD: f32 = 1.3;
+/// Extra pixels copied around the glass region so the blur never reads stale texels.
+/// Reach of the blur per axis: 5.2 × spread quarter texels ≈ 27 px, plus the 4×4
+/// downsample and bilinear upsample.
+const BLUR_MARGIN: f32 = 40.0;
+/// What glass shows when the back buffer cannot be blurred (MSAA, float formats).
+const BACKDROP_FALLBACK: [u8; 4] = [20, 22, 30, 255];
 
 const VERTEX_SIZE: usize = size_of::<Vertex>();
 const _: () = assert!(
@@ -223,6 +295,209 @@ pub struct MeshRenderer {
     vertices: Option<Dynamic>,
     indices: Option<Dynamic>,
     textures: HashMap<TextureId, Texture>,
+    blur: BlurPipeline,
+    /// Copy and quarter-resolution targets for the current back buffer size and format.
+    backdrop: Option<Backdrop>,
+    /// 1×1 stand-ins: [backdrop when it cannot be blurred, white gradient row].
+    fallback: [ID3D11ShaderResourceView; 2],
+}
+
+struct BlurPipeline {
+    vs: ID3D11VertexShader,
+    down: ID3D11PixelShader,
+    blur: ID3D11PixelShader,
+    /// Blending off: the passes overwrite their targets.
+    opaque: ID3D11BlendState,
+    constants: ID3D11Buffer,
+}
+
+struct BlurTarget {
+    view: ID3D11RenderTargetView,
+    srv: ID3D11ShaderResourceView,
+}
+
+struct Backdrop {
+    size: [u32; 2],
+    format: DXGI_FORMAT,
+    /// Copy of the back buffer region; `None` when the back buffer itself is
+    /// shader-readable (then the downsample reads it directly, no copy).
+    copy: Option<(ID3D11Texture2D, ID3D11ShaderResourceView)>,
+    quarter: [BlurTarget; 2],
+    qsize: [u32; 2],
+}
+
+/// The back buffer can be sampled as it is (shader-input usage, plain UNORM format).
+fn direct_readable(desc: &D3D11_TEXTURE2D_DESC) -> bool {
+    desc.BindFlags & D3D11_BIND_SHADER_RESOURCE.0 as u32 != 0
+        && matches!(
+            desc.Format,
+            DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_R10G10B10A2_UNORM
+        )
+}
+
+/// Copy format and its shader view for a back-buffer format (8-bit and 10-bit UNORM,
+/// sRGB or not; sRGB is copied typeless and read as UNORM so the blur stays in gamma
+/// space like the rest of the menu); `None` for formats the blur does not handle.
+fn copy_formats(format: DXGI_FORMAT) -> Option<(DXGI_FORMAT, DXGI_FORMAT)> {
+    match format {
+        DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_R10G10B10A2_UNORM => {
+            Some((format, format))
+        }
+        DXGI_FORMAT_R8G8B8A8_UNORM_SRGB => {
+            Some((DXGI_FORMAT_R8G8B8A8_TYPELESS, DXGI_FORMAT_R8G8B8A8_UNORM))
+        }
+        DXGI_FORMAT_B8G8R8A8_UNORM_SRGB => {
+            Some((DXGI_FORMAT_B8G8R8A8_TYPELESS, DXGI_FORMAT_B8G8R8A8_UNORM))
+        }
+        _ => None,
+    }
+}
+
+fn shader_view(
+    device: &ID3D11Device,
+    texture: &ID3D11Texture2D,
+    format: Option<DXGI_FORMAT>,
+) -> Result<ID3D11ShaderResourceView, String> {
+    let desc = format.map(|f| D3D11_SHADER_RESOURCE_VIEW_DESC {
+        Format: f,
+        ViewDimension: D3D_SRV_DIMENSION_TEXTURE2D,
+        Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
+            Texture2D: D3D11_TEX2D_SRV {
+                MostDetailedMip: 0,
+                MipLevels: 1,
+            },
+        },
+    });
+    let mut view = None;
+    // SAFETY: The texture and optional descriptor are live for the call; one owned
+    // reference is returned.
+    let result = unsafe {
+        device.CreateShaderResourceView(
+            texture,
+            desc.as_ref().map(|d| d as *const _),
+            Some(&mut view),
+        )
+    };
+    created("CreateShaderResourceView(Menü)", result, view)
+}
+
+/// An immutable 1×1 RGBA8 texture view.
+fn texel_view(device: &ID3D11Device, rgba: [u8; 4]) -> Result<ID3D11ShaderResourceView, String> {
+    let desc = texture_desc(
+        DXGI_FORMAT_R8G8B8A8_UNORM,
+        [1, 1],
+        D3D11_USAGE_IMMUTABLE,
+        D3D11_BIND_SHADER_RESOURCE,
+        D3D11_CPU_ACCESS_FLAG(0),
+    );
+    let initial = D3D11_SUBRESOURCE_DATA {
+        pSysMem: rgba.as_ptr().cast(),
+        SysMemPitch: 4,
+        SysMemSlicePitch: 0,
+    };
+    // SAFETY: one 1×1 RGBA8 texel, alive for the synchronous creation.
+    let texture = unsafe { create_texture(device, &desc, Some(&initial)) }
+        .map_err(hr("CreateTexture2D(Menü-Texel)"))?;
+    shader_view(device, &texture, None)
+}
+
+fn pixel_shader(
+    device: &ID3D11Device,
+    source: &str,
+    entry: &CStr,
+) -> Result<ID3D11PixelShader, String> {
+    let blob = compile_shader(source, entry, c"ps_4_0")?;
+    let mut ps = None;
+    // SAFETY: The compiled blob owns the shader bytes for the call; one owned reference.
+    let result = unsafe { device.CreatePixelShader(blob_bytes(&blob), None, Some(&mut ps)) };
+    created("CreatePixelShader(Menü)", result, ps)
+}
+
+impl BlurPipeline {
+    fn new(device: &ID3D11Device) -> Result<Self, String> {
+        let vs_blob = compile_shader(BLUR_SHADER, c"vs_full", c"vs_4_0")?;
+        let mut vs = None;
+        // SAFETY: The compiled blob owns the shader bytes for the call; one owned reference.
+        let result =
+            unsafe { device.CreateVertexShader(blob_bytes(&vs_blob), None, Some(&mut vs)) };
+        let vs = created("CreateVertexShader(Menü-Blur)", result, vs)?;
+        let off = D3D11_RENDER_TARGET_BLEND_DESC {
+            BlendEnable: false.into(),
+            SrcBlend: D3D11_BLEND_ONE,
+            DestBlend: D3D11_BLEND_ZERO,
+            BlendOp: D3D11_BLEND_OP_ADD,
+            SrcBlendAlpha: D3D11_BLEND_ONE,
+            DestBlendAlpha: D3D11_BLEND_ZERO,
+            BlendOpAlpha: D3D11_BLEND_OP_ADD,
+            RenderTargetWriteMask: D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8,
+        };
+        let desc = D3D11_BLEND_DESC {
+            RenderTarget: [off; 8],
+            ..Default::default()
+        };
+        let mut opaque = None;
+        // SAFETY: The descriptor is live during the call; one owned reference is returned.
+        let result = unsafe { device.CreateBlendState(&desc, Some(&mut opaque)) };
+        Ok(Self {
+            vs,
+            down: pixel_shader(device, BLUR_SHADER, c"ps_down")?,
+            blur: pixel_shader(device, BLUR_SHADER, c"ps_blur")?,
+            opaque: created("CreateBlendState(Menü-Blur)", result, opaque)?,
+            constants: dynamic_buffer(device, 32, D3D11_BIND_CONSTANT_BUFFER)?,
+        })
+    }
+}
+
+impl Backdrop {
+    fn new(
+        device: &ID3D11Device,
+        size: [u32; 2],
+        format: DXGI_FORMAT,
+        direct: bool,
+    ) -> Result<Self, String> {
+        let copy = if direct {
+            None
+        } else {
+            let (typeless, view) = copy_formats(format).ok_or("Menü: Format ohne Blur")?;
+            let desc = texture_desc(
+                typeless,
+                size,
+                D3D11_USAGE_DEFAULT,
+                D3D11_BIND_SHADER_RESOURCE,
+                D3D11_CPU_ACCESS_FLAG(0),
+            );
+            // SAFETY: no initial-data pointers are supplied.
+            let copy = unsafe { create_texture(device, &desc, None) }
+                .map_err(hr("CreateTexture2D(Menü-Backdrop)"))?;
+            let srv = shader_view(device, &copy, Some(view))?;
+            Some((copy, srv))
+        };
+        let qsize = [size[0].div_ceil(4).max(1), size[1].div_ceil(4).max(1)];
+        let quarter = || -> Result<BlurTarget, String> {
+            let desc = texture_desc(
+                DXGI_FORMAT_R8G8B8A8_UNORM,
+                qsize,
+                D3D11_USAGE_DEFAULT,
+                D3D11_BIND_FLAG(D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0),
+                D3D11_CPU_ACCESS_FLAG(0),
+            );
+            // SAFETY: no initial-data pointers are supplied.
+            let texture = unsafe { create_texture(device, &desc, None) }
+                .map_err(hr("CreateTexture2D(Menü-Blur)"))?;
+            Ok(BlurTarget {
+                view: render_target_view(device, &texture)
+                    .map_err(hr("CreateRenderTargetView(Menü-Blur)"))?,
+                srv: shader_view(device, &texture, None)?,
+            })
+        };
+        Ok(Self {
+            size,
+            format,
+            copy,
+            quarter: [quarter()?, quarter()?],
+            qsize,
+        })
+    }
 }
 
 struct Dynamic {
@@ -383,10 +658,18 @@ impl MeshRenderer {
             sampler(D3D11_FILTER_MIN_MAG_MIP_POINT)?,
         ];
 
-        let constants = dynamic_buffer(&device, 16, D3D11_BIND_CONSTANT_BUFFER)
+        let constants = dynamic_buffer(&device, 32, D3D11_BIND_CONSTANT_BUFFER)
             .map_err(|e| e.replace("(Menü)", "(Menü-Konstanten)"))?;
+        let blur = BlurPipeline::new(&device)?;
+        let fallback = [
+            texel_view(&device, BACKDROP_FALLBACK)?,
+            texel_view(&device, [255; 4])?,
+        ];
 
         Ok(Self {
+            blur,
+            backdrop: None,
+            fallback,
             device,
             context,
             state,
@@ -442,6 +725,160 @@ impl MeshRenderer {
         // SAFETY: Unmaps the subresource mapped above on the same context.
         unsafe { self.context.Unmap(buffer, 0) };
         Ok(())
+    }
+
+    fn write_floats(&self, buffer: &ID3D11Buffer, values: &[f32; 8]) -> Result<(), String> {
+        self.write(buffer, |dst| {
+            // SAFETY: both constant buffers hold exactly 32 bytes = eight f32.
+            unsafe { core::ptr::copy_nonoverlapping(values.as_ptr().cast::<u8>(), dst, 32) };
+        })
+    }
+
+    /// (Re)creates the blur targets for this back buffer; false when it cannot be blurred
+    /// (multisampled or a format without a typeless copy).
+    fn prepare_backdrop(&mut self, desc: &D3D11_TEXTURE2D_DESC) -> Result<bool, String> {
+        let size = [desc.Width, desc.Height];
+        if desc.SampleDesc.Count != 1 || copy_formats(desc.Format).is_none() {
+            return Ok(false);
+        }
+        let direct = direct_readable(desc);
+        if self
+            .backdrop
+            .as_ref()
+            .is_none_or(|b| b.size != size || b.format != desc.Format || b.copy.is_none() != direct)
+        {
+            // Old targets go first: at most one set alive.
+            self.backdrop.take();
+            self.backdrop = Some(Backdrop::new(&self.device, size, desc.Format, direct)?);
+            eprintln!(
+                "Menü: Glas-Blur {} ({}x{}, {:?})",
+                if direct {
+                    "liest den Backbuffer direkt"
+                } else {
+                    "über Teilkopie"
+                },
+                size[0],
+                size[1],
+                desc.Format
+            );
+        }
+        Ok(true)
+    }
+
+    /// Blurs the back buffer under `region` (pixels) into the quarter-resolution target
+    /// and returns its view plus the UV scale for the main shader. Runs inside the
+    /// swapped context state; never waits on the GPU.
+    fn blur_backdrop(
+        &self,
+        target: &ID3D11Texture2D,
+        desc: &D3D11_TEXTURE2D_DESC,
+        region: crate::draw::Rect,
+    ) -> Result<Option<(ID3D11ShaderResourceView, [f32; 2])>, String> {
+        let size = [desc.Width, desc.Height];
+        let Some(b) = self.backdrop.as_ref() else {
+            return Ok(None);
+        };
+        // Copy box: the glass region plus a margin, on the 4-pixel grid.
+        let clamp = |v: f32, max: u32| (v.max(0.0) as u32).min(max);
+        let x0 = clamp(region.min[0] - BLUR_MARGIN, size[0]) / 4 * 4;
+        let y0 = clamp(region.min[1] - BLUR_MARGIN, size[1]) / 4 * 4;
+        let x1 = clamp(region.max[0] + BLUR_MARGIN, size[0]).div_ceil(4) * 4;
+        let y1 = clamp(region.max[1] + BLUR_MARGIN, size[1]).div_ceil(4) * 4;
+        let (x1, y1) = (x1.min(size[0]), y1.min(size[1]));
+        if x0 >= x1 || y0 >= y1 {
+            return Ok(None);
+        }
+        let copy_box = D3D11_BOX {
+            left: x0,
+            top: y0,
+            front: 0,
+            right: x1,
+            bottom: y1,
+            back: 1,
+        };
+        let q = b.qsize;
+        let scissor = RECT {
+            left: (x0 / 4) as i32,
+            top: (y0 / 4) as i32,
+            right: x1.div_ceil(4).min(q[0]) as i32,
+            bottom: y1.div_ceil(4).min(q[1]) as i32,
+        };
+        let full = [(q[0] * 4) as f32, (q[1] * 4) as f32];
+        let down = [
+            1.0 / size[0] as f32,
+            1.0 / size[1] as f32,
+            0.0,
+            0.0,
+            full[0] / size[0] as f32,
+            full[1] / size[1] as f32,
+            0.0,
+            0.0,
+        ];
+        let h = [0.0, 0.0, BLUR_SPREAD / q[0] as f32, 0.0, 1.0, 1.0, 0.0, 0.0];
+        let v = [0.0, 0.0, 0.0, BLUR_SPREAD / q[1] as f32, 1.0, 1.0, 0.0, 0.0];
+        // Source of the downsample: the back buffer itself when readable, else the copy.
+        let (copy, source) = match &b.copy {
+            Some((copy, srv)) => (Some(copy.clone()), srv.clone()),
+            None => (None, shader_view(&self.device, target, None)?),
+        };
+        let [qa, qb] = [&b.quarter[0], &b.quarter[1]];
+        let (qa_rtv, qa_srv, qb_rtv, qb_srv) = (
+            qa.view.clone(),
+            qa.srv.clone(),
+            qb.view.clone(),
+            qb.srv.clone(),
+        );
+        let context = &self.context;
+        let constants = [Some(self.blur.constants.clone())];
+        let none: [Option<ID3D11ShaderResourceView>; 1] = [None];
+        let pass = |rtv: &ID3D11RenderTargetView,
+                    src: &ID3D11ShaderResourceView,
+                    ps: &ID3D11PixelShader,
+                    values: &[f32; 8]|
+         -> Result<(), String> {
+            self.write_floats(&self.blur.constants, values)?;
+            // SAFETY: every bound object is owned by this renderer and live; the source
+            // view is unbound before its texture becomes a render target again.
+            unsafe {
+                context.PSSetShaderResources(0, Some(&none));
+                context.OMSetRenderTargets(Some(&[Some(rtv.clone())]), None);
+                context.PSSetShaderResources(0, Some(&[Some(src.clone())]));
+                context.PSSetShader(ps, None);
+                context.Draw(3, 0);
+            }
+            Ok(())
+        };
+        // SAFETY: Same device and context; the copy box lies inside both textures (same
+        // size, compatible typeless format); pipeline objects are owned and live.
+        unsafe {
+            if let Some(copy) = &copy {
+                context.CopySubresourceRegion(copy, 0, x0, y0, 0, target, 0, Some(&copy_box));
+            }
+            context.IASetInputLayout(None);
+            context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            context.VSSetShader(&self.blur.vs, None);
+            context.PSSetConstantBuffers(0, Some(&constants));
+            context.PSSetSamplers(0, Some(&[Some(self.samplers[0].clone())]));
+            context.OMSetBlendState(&self.blur.opaque, Some(&[0.0; 4]), u32::MAX);
+            context.OMSetDepthStencilState(&self.depth, 0);
+            context.RSSetState(&self.rasterizer);
+            context.RSSetViewports(Some(&[D3D11_VIEWPORT {
+                Width: q[0] as f32,
+                Height: q[1] as f32,
+                MaxDepth: 1.0,
+                ..Default::default()
+            }]));
+            context.RSSetScissorRects(Some(&[scissor]));
+        }
+        pass(&qa_rtv, &source, &self.blur.down, &down)?;
+        pass(&qb_rtv, &qa_srv, &self.blur.blur, &h)?;
+        pass(&qa_rtv, &qb_srv, &self.blur.blur, &v)?;
+        // SAFETY: unbinds the last source and target (the main pass binds its own).
+        unsafe {
+            context.PSSetShaderResources(0, Some(&none));
+            context.OMSetRenderTargets(None, None);
+        }
+        Ok(Some((qa_srv, [1.0 / full[0], 1.0 / full[1]])))
     }
 }
 
@@ -602,22 +1039,40 @@ impl MenuRenderer for MeshRenderer {
         // SAFETY: The texture is live and the descriptor is a writable output.
         unsafe { target.GetDesc(&mut target_desc) };
         let srgb = is_srgb(target_desc.Format);
-        let screen = [
-            width as f32,
-            height as f32,
-            if srgb { 1.0 } else { 0.0 },
-            0.0,
-        ];
-        self.write(&self.constants, |dst| {
-            // SAFETY: the constant buffer holds exactly 16 bytes = four f32.
-            unsafe { core::ptr::copy_nonoverlapping(screen.as_ptr().cast::<u8>(), dst, 16) };
-        })?;
+        let blur = match list.backdrop {
+            Some(region) if self.prepare_backdrop(&target_desc)? => Some(region),
+            _ => None,
+        };
 
         // Per frame: holding the backbuffer beyond the frame makes ResizeBuffers fail.
         let rtv =
             render_target_view(&self.device, target).map_err(hr("CreateRenderTargetView(Menü)"))?;
         let context = &self.context;
         let _restore = ContextState::enter(context, &self.state);
+        // Backdrop blur first (own passes), then the menu in one pipeline.
+        let blurred = match blur {
+            Some(region) => self.blur_backdrop(target, &target_desc, region)?,
+            None => None,
+        };
+        let (backdrop, backdrop_scale) = match blurred {
+            Some((view, scale)) => (view, scale),
+            None => (self.fallback[0].clone(), [0.0, 0.0]),
+        };
+        let lut = self
+            .textures
+            .get(&GRADIENT_TEXTURE)
+            .map_or_else(|| self.fallback[1].clone(), |t| t.view.clone());
+        let screen = [
+            width as f32,
+            height as f32,
+            if srgb { 1.0 } else { 0.0 },
+            0.0,
+            backdrop_scale[0],
+            backdrop_scale[1],
+            0.0,
+            0.0,
+        ];
+        self.write_floats(&self.constants, &screen)?;
         let stride = VERTEX_SIZE as u32;
         let offset = 0u32;
         let vertex_buffers = [Some(vb)];
@@ -651,6 +1106,8 @@ impl MenuRenderer for MeshRenderer {
             };
             context.RSSetViewports(Some(&[viewport]));
             context.OMSetRenderTargets(Some(&[Some(rtv)]), None);
+            context.PSSetShaderResources(1, Some(&[Some(backdrop), Some(lut)]));
+            context.PSSetSamplers(1, Some(&[Some(self.samplers[0].clone())]));
         }
         for cmd in &list.commands {
             let (Some([left, top, right, bottom]), Some(texture)) =
@@ -899,6 +1356,151 @@ mod tests {
             .unwrap();
         let pixel = target.pixels()[8 * 16 + 8];
         assert!(near(pixel, [128, 64, 200, 255]), "sRGB: {pixel:?}");
+    }
+
+    /// `gradient_uv` samples the 256×1 gradient row; without one, white.
+    #[test]
+    fn gradient_uv_samples_the_lookup_row() {
+        use crate::draw::{GRADIENT_WIDTH, gradient_uv};
+        let target = Target::new(32, 8, DXGI_FORMAT_R8G8B8A8_UNORM);
+        let mut renderer = MeshRenderer::new(target.device.clone()).unwrap();
+        let mut list = DrawList::default();
+        let quad = |list: &mut DrawList, x: f32, t: f32| {
+            let uv = Rect {
+                min: gradient_uv(t),
+                max: gradient_uv(t),
+            };
+            list.quad_uv(
+                Rect::new(x, 0.0, 8.0, 8.0),
+                uv,
+                rgba(255, 255, 255, 255),
+                FONT_TEXTURE,
+            );
+        };
+        quad(&mut list, 0.0, 0.0);
+        quad(&mut list, 24.0, 1.0);
+        // Red → blue row.
+        let row: Vec<u8> = (0..GRADIENT_WIDTH)
+            .flat_map(|i| {
+                let t = i as f32 / (GRADIENT_WIDTH - 1) as f32;
+                [((1.0 - t) * 255.0) as u8, 0, (t * 255.0) as u8, 255]
+            })
+            .collect();
+        let lut = TextureDelta::Create {
+            id: GRADIENT_TEXTURE,
+            size: [GRADIENT_WIDTH, 1],
+            rgba: row,
+            nearest: false,
+        };
+        renderer
+            .paint(&target.texture, &[white(), lut], &list, target.size)
+            .unwrap();
+        let px = target.pixels();
+        assert!(
+            near(px[4 * 32 + 4], [255, 0, 0, 255]),
+            "{:?}",
+            px[4 * 32 + 4]
+        );
+        assert!(
+            near(px[4 * 32 + 28], [0, 0, 255, 255]),
+            "{:?}",
+            px[4 * 32 + 28]
+        );
+    }
+
+    /// A shape with `BACKDROP_UV` shows the blurred back buffer under it (tone-mapped,
+    /// same hue), sharp edges in the picture get soft, and the game's render target is
+    /// restored afterwards. Without `backdrop` the dark stand-in texel is used.
+    #[test]
+    fn backdrop_uv_shows_the_blurred_back_buffer() {
+        use crate::draw::BACKDROP_UV;
+        let target = Target::new(128, 64, DXGI_FORMAT_R8G8B8A8_UNORM);
+        let mut renderer = MeshRenderer::new(target.device.clone()).unwrap();
+        // "Game": left half red, right half green.
+        let mut game = DrawList::default();
+        solid(
+            &mut game,
+            Rect::new(0.0, 0.0, 64.0, 64.0),
+            rgba(255, 0, 0, 255),
+        );
+        solid(
+            &mut game,
+            Rect::new(64.0, 0.0, 64.0, 64.0),
+            rgba(0, 255, 0, 255),
+        );
+        renderer
+            .paint(&target.texture, &[white()], &game, target.size)
+            .unwrap();
+        let glass = Rect::new(16.0, 16.0, 96.0, 32.0);
+        let mut list = DrawList::default();
+        let uv = Rect {
+            min: BACKDROP_UV,
+            max: BACKDROP_UV,
+        };
+        list.quad_uv(glass, uv, rgba(255, 255, 255, 255), FONT_TEXTURE);
+        list.add_backdrop(glass);
+        renderer
+            .paint(&target.texture, &[], &list, target.size)
+            .unwrap();
+        assert_eq!(
+            target.bound_rtv(),
+            Some(target.rtv.as_raw()),
+            "game RTV restored"
+        );
+        let px = target.pixels();
+        let at = |x: usize, y: usize| px[y * 128 + x];
+        let left = at(24, 32);
+        assert!(left[0] > 60 && left[1] < 30, "red side stays red: {left:?}");
+        assert!(left[0] < 230, "bright backdrop is toned down: {left:?}");
+        let right = at(104, 32);
+        assert!(right[1] > 60 && right[0] < 30, "green side: {right:?}");
+        let edge = at(64, 32);
+        assert!(
+            edge[0] > 20 && edge[1] > 20,
+            "blurred across the edge: {edge:?}"
+        );
+        assert_eq!(at(4, 4), [255, 0, 0, 255], "outside the glass untouched");
+
+        // No backdrop region: the fallback texel, no blur pass.
+        list.backdrop = None;
+        renderer
+            .paint(&target.texture, &[], &list, target.size)
+            .unwrap();
+        let px = target.pixels();
+        let f = px[32 * 128 + 24];
+        assert!(near(f, [20, 22, 30, 255]), "fallback: {f:?}");
+    }
+
+    /// sRGB back buffers blur through the typeless copy and stay in gamma space: a flat
+    /// mid grey comes back as a darker grey (the soft luminance cap), never the fallback.
+    #[test]
+    fn backdrop_on_srgb_back_buffer() {
+        use crate::draw::BACKDROP_UV;
+        let target = Target::new(64, 64, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB);
+        let mut renderer = MeshRenderer::new(target.device.clone()).unwrap();
+        let mut game = DrawList::default();
+        solid(
+            &mut game,
+            Rect::new(0.0, 0.0, 64.0, 64.0),
+            rgba(128, 128, 128, 255),
+        );
+        renderer
+            .paint(&target.texture, &[white()], &game, target.size)
+            .unwrap();
+        let mut list = DrawList::default();
+        let uv = Rect {
+            min: BACKDROP_UV,
+            max: BACKDROP_UV,
+        };
+        let glass = Rect::new(8.0, 8.0, 48.0, 48.0);
+        list.quad_uv(glass, uv, rgba(255, 255, 255, 255), FONT_TEXTURE);
+        list.add_backdrop(glass);
+        renderer
+            .paint(&target.texture, &[], &list, target.size)
+            .unwrap();
+        let p = target.pixels()[32 * 64 + 32];
+        // 128/255 = 0.5 → 0.5 / (1 + 1.5 * 0.5) ≈ 0.29 → ~73 in gamma space.
+        assert!((60..=90).contains(&p[0]) && p[0] == p[2], "{p:?}");
     }
 
     #[test]
