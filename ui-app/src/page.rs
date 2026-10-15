@@ -2,8 +2,8 @@
 //! their live values next to them, the appearance editor) and the full widget gallery.
 //!
 //! The glass blurs whatever is in the back buffer under it. In the game that is the game
-//! picture; here it is [`wallpaper`], a slowly drifting set of colour blobs painted inside
-//! the shell before the kit draws.
+//! picture; here it is [`wallpaper`], a plain dark fill painted inside the shell before the
+//! kit draws.
 
 use poly_ui::draw::{DrawList, Rect, TextureDelta};
 use poly_ui::kit::gallery::{self, GalleryState, WEAPONS};
@@ -55,8 +55,6 @@ pub struct Page {
     gallery: GalleryState,
     search: String,
     fps: f32,
-    /// Seconds since start (drives the wallpaper drift).
-    time: f32,
     backdrop: DrawList,
 }
 
@@ -72,7 +70,6 @@ impl Page {
             gallery: GalleryState::default(),
             search: String::new(),
             fps: 0.0,
-            time: 0.0,
             backdrop: DrawList::default(),
         })
     }
@@ -106,14 +103,13 @@ impl Page {
             let fps = 1.0 / input.dt;
             self.fps += (fps - self.fps) * if self.fps == 0.0 { 1.0 } else { 0.05 };
         }
-        self.time += input.dt;
         self.shell.host = Some(margin);
         self.kit.begin(input, size);
         let close = self.build(size);
         let radius = self.kit.theme.pxf(self.kit.theme.radius.xl);
         let (list, textures) = self.kit.end();
         self.backdrop.clear();
-        wallpaper(&mut self.backdrop, self.shell.window(), radius, self.time);
+        wallpaper(&mut self.backdrop, self.shell.window(), radius);
         (&self.backdrop, list, textures, close)
     }
 
@@ -350,32 +346,13 @@ fn gradient_preview(kit: &mut Kit) {
     kit.lit_rim(bar, h / 2.0, 1.0);
 }
 
-/// What the glass of `window` blurs: a deep blue-violet base with large colour blobs that
-/// drift slowly with `time` (seconds). Blobs stay inside the window inset by its corner
-/// `radius`, so nothing shows past the rounded corners.
-fn wallpaper(list: &mut DrawList, window: Rect, radius: f32, time: f32) {
+/// What the glass of `window` blurs: a plain deep blue-violet base inside the shell's
+/// rounded corners.
+fn wallpaper(list: &mut DrawList, window: Rect, radius: f32) {
     if window.width() <= 2.0 * radius || window.height() <= 2.0 * radius {
         return;
     }
     list.fill_rounded(window, radius, Color::rgb(14, 16, 34).pm());
-    let inner = window.shrink(radius);
-    let (w, h) = (inner.width(), inner.height());
-    // (centre x, centre y, radius as part of the smaller side, colour, drift speed)
-    let blobs = [
-        (0.18, 0.22, 0.42, Color::rgb(255, 72, 140), 0.11),
-        (0.82, 0.18, 0.36, Color::rgb(58, 150, 255), 0.07),
-        (0.55, 0.62, 0.48, Color::rgb(126, 84, 255), 0.05),
-        (0.12, 0.85, 0.30, Color::rgb(0, 214, 190), 0.09),
-        (0.88, 0.80, 0.34, Color::rgb(255, 170, 60), 0.08),
-    ];
-    let side = w.min(h);
-    for (i, (x, y, r, color, speed)) in blobs.into_iter().enumerate() {
-        let phase = time * speed + i as f32 * 1.7;
-        let r = (side * r * 0.5).min(w / 2.0).min(h / 2.0);
-        let cx = inner.min[0] + (w * x + phase.sin() * w * 0.08).clamp(r, w - r);
-        let cy = inner.min[1] + (h * y + (phase * 1.3).cos() * h * 0.08).clamp(r, h - r);
-        list.circle([cx, cy], r, color.alpha(0.85).pm());
-    }
 }
 
 fn on_off(v: bool) -> &'static str {
@@ -434,10 +411,15 @@ mod tests {
         assert!(closed, "close button");
     }
 
+    /// The whole page on the offscreen GPU target (WARP on Windows, Metal on macOS).
     #[test]
-    fn test_page_renders_on_warp() {
+    fn test_page_renders_on_gpu() {
+        #[cfg(windows)]
+        use poly_ui::d3d11::Offscreen;
+        #[cfg(target_os = "macos")]
+        use poly_ui::metal::Offscreen;
         let mut page = Page::new(1.0).unwrap();
-        let mut target = poly_ui::d3d11::Offscreen::new(SIZE[0], SIZE[1]).unwrap();
+        let mut target = Offscreen::new(SIZE[0], SIZE[1]).unwrap();
         let margin = page.shadow_margin();
         let mut textures = Vec::new();
         for _ in 0..3 {
