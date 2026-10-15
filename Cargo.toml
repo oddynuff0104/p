@@ -1,0 +1,14 @@
+[workspace]
+resolver = "3"
+members = ["ui", "ui-app"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.96"
+
+[workspace.dependencies]
+windows-sys = "0.61.2"
+windows = { version = "0.62.2", default-features = false }
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"

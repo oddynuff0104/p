@@ -1,0 +1,15 @@
+[package]
+name = "poly-ui"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "Poly UI kit: immediate-mode widgets, theme, draw lists and the D3D11 renderer"
+publish = false
+
+[dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
+windows = { workspace = true, features = ["Win32_Foundation", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Win32_Graphics_Direct3D_Fxc", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common"] }
+ab_glyph = { version = "0.2.32", default-features = false, features = ["std"] }
+
+[lints]
+workspace = true
